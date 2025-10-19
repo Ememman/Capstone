@@ -1,0 +1,49 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon src/index.js",
+    "seed:import": "node src/seeder.js",
+    "seed:destroy": "node src/seeder.js -d",
+    "data:import": "node src/seeder.js",
+    "data:destroy": "node src/seeder.js -d",
+    "seed": "npm run seed:import",
+    "create-admin": "node src/scripts/createFirstAdmin.js",
+    "seed:services": "node src/scripts/seedServices.js",
+    "seed:products": "node src/scripts/seedProducts.js",
+    "seed:appointments": "node src/scripts/seedAppointments.js",
+    "seed:users": "node src/scripts/seedUsers.js",
+    "seed:all": "npm run seed:users && npm run seed:services && npm run seed:products && npm run seed:appointments",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "type": "module",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.12.2",
+    "bcryptjs": "^3.0.2",
+    "cloudinary": "^2.7.0",
+    "cors": "^2.8.5",
+    "date-fns": "^4.1.0",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "express-validator": "^7.2.1",
+    "google-auth-library": "^10.3.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.18.1",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.6",
+    "socket.io": "^4.8.1",
+    "twilio": "^5.9.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "nodemon": "^3.1.10"
+  }
+}
