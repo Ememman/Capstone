@@ -1,3 +1,4 @@
+// appointmentRoutes.js - COMPLETE UPDATED WITH ACTIVITY TRACKING
 import express from "express";
 import Appointment from "../models/Appointment.js";
 import mongoose from "mongoose";
@@ -7,6 +8,7 @@ import {
   customerOnly,
   staffOnly,
 } from "../middleware/auth.js";
+import notificationService from "../services/notificationService.js";
 
 const router = express.Router();
 
@@ -47,6 +49,7 @@ router.get("/", optionalAuth, async (req, res) => {
     const appointments = await Appointment.find(filter)
       .populate("customer", populateFields)
       .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position") // Added assigned staff population
       .sort({ appointmentDate: 1, appointmentTime: 1 })
       .skip(skip)
       .limit(Number.parseInt(limit));
@@ -102,7 +105,9 @@ router.get("/:id", optionalAuth, async (req, res) => {
 
     const appointment = await Appointment.findById(id)
       .populate("customer", populateFields)
-      .populate("service", "name duration priceRange category");
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position") // Added assigned staff population
+      .populate("completedBy", "username profileImage position"); // Added completedBy population
 
     if (!appointment) {
       return res.status(404).json({
@@ -168,6 +173,7 @@ router.get("/customer/:customerId", authMiddleware, async (req, res) => {
     const appointments = await Appointment.find(filter)
       .populate("customer", populateFields)
       .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position") // Added assigned staff population
       .sort({ appointmentDate: 1, appointmentTime: 1 });
 
     res.json({
@@ -197,6 +203,7 @@ router.post("/", authMiddleware, customerOnly, async (req, res) => {
       notes,
       salonLocation,
       totalAmount,
+      assignedStaff, // Allow customer to choose staff if needed
     } = req.body;
 
     const customer = req.user._id;
@@ -214,6 +221,13 @@ router.post("/", authMiddleware, customerOnly, async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid service ID",
+      });
+    }
+
+    if (assignedStaff && !mongoose.Types.ObjectId.isValid(assignedStaff)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid staff ID",
       });
     }
 
@@ -239,6 +253,7 @@ router.post("/", authMiddleware, customerOnly, async (req, res) => {
       notes,
       salonLocation,
       totalAmount,
+      assignedStaff,
     });
 
     const savedAppointment = await appointment.save();
@@ -246,7 +261,21 @@ router.post("/", authMiddleware, customerOnly, async (req, res) => {
       savedAppointment._id
     )
       .populate("customer", "username email")
-      .populate("service", "name duration priceRange category");
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    // Track appointment scheduling activity
+    await notificationService.trackUserActivity(
+      customer,
+      "appointment_scheduled",
+      {
+        appointmentId: savedAppointment._id,
+        serviceId: service,
+        appointmentDate: appointmentDate,
+        appointmentTime: appointmentTime,
+        assignedStaff: assignedStaff,
+      }
+    );
 
     res.status(201).json({
       success: true,
@@ -302,7 +331,18 @@ router.put("/:id", authMiddleware, async (req, res) => {
       { new: true, runValidators: true }
     )
       .populate("customer", "username email")
-      .populate("service", "name duration priceRange category");
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    // Track appointment update activity
+    await notificationService.trackUserActivity(
+      appointment.customer,
+      "appointment_updated",
+      {
+        appointmentId: appointment._id,
+        updatedFields: Object.keys(req.body),
+      }
+    );
 
     res.json({
       success: true,
@@ -364,12 +404,28 @@ router.put("/:id/cancel", authMiddleware, async (req, res) => {
       appointment.cancellationReason = cancellationReason;
     }
 
+    // Set cancelled by based on user role
+    appointment.cancelledBy =
+      req.user.role === "customer" ? "customer" : "staff";
+
     const updatedAppointment = await appointment.save();
     const populatedAppointment = await Appointment.findById(
       updatedAppointment._id
     )
       .populate("customer", "username email")
-      .populate("service", "name duration priceRange category");
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    // Track appointment cancellation activity
+    await notificationService.trackUserActivity(
+      appointment.customer,
+      "appointment_cancelled",
+      {
+        appointmentId: appointment._id,
+        cancellationReason: cancellationReason,
+        cancelledBy: appointment.cancelledBy,
+      }
+    );
 
     res.json({
       success: true,
@@ -391,13 +447,7 @@ router.put("/:id/cancel", authMiddleware, async (req, res) => {
 router.put("/:id/complete", authMiddleware, staffOnly, async (req, res) => {
   try {
     const { id } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid appointment ID",
-      });
-    }
+    const { staffNotes } = req.body;
 
     const appointment = await Appointment.findById(id);
 
@@ -416,19 +466,38 @@ router.put("/:id/complete", authMiddleware, staffOnly, async (req, res) => {
     }
 
     appointment.status = "completed";
+    appointment.completedBy = req.user._id;
     appointment.paymentStatus = "paid";
+    if (staffNotes) {
+      appointment.staffNotes = staffNotes;
+    }
 
     const updatedAppointment = await appointment.save();
     const populatedAppointment = await Appointment.findById(
       updatedAppointment._id
     )
       .populate("customer", "username email")
-      .populate("service", "name duration priceRange category");
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    // Track appointment completion activity
+    await notificationService.trackUserActivity(
+      appointment.customer,
+      "appointment_completed",
+      {
+        appointmentId: appointment._id,
+        serviceId: appointment.service,
+        completedBy: req.user._id,
+        staffNotes: staffNotes,
+      }
+    );
 
     res.json({
       success: true,
-      message: "Appointment completed successfully",
+      message:
+        "Appointment completed successfully. Customer can now rate the service.",
       data: populatedAppointment,
+      canRate: true,
     });
   } catch (error) {
     res.status(500).json({
@@ -439,14 +508,17 @@ router.put("/:id/complete", authMiddleware, staffOnly, async (req, res) => {
   }
 });
 
-// @desc    Delete appointment
+// @desc    Delete appointment - FIXED VERSION
 // @route   DELETE /api/appointments/:id
 // @access  Private (staff only)
 router.delete("/:id", authMiddleware, staffOnly, async (req, res) => {
   try {
     const { id } = req.params;
 
+    console.log(`🗑️ Deleting appointment: ${id}`);
+
     if (!mongoose.Types.ObjectId.isValid(id)) {
+      console.log(`❌ Invalid appointment ID: ${id}`);
       return res.status(400).json({
         success: false,
         message: "Invalid appointment ID",
@@ -456,19 +528,41 @@ router.delete("/:id", authMiddleware, staffOnly, async (req, res) => {
     const appointment = await Appointment.findById(id);
 
     if (!appointment) {
+      console.log(`❌ Appointment ${id} not found`);
       return res.status(404).json({
         success: false,
         message: "Appointment not found",
       });
     }
 
+    // Check if staff has permission to delete this appointment
+    const canDeleteAny = req.user.permissions?.includes(
+      "manage_all_appointments"
+    );
+    const isAssignedStaff =
+      appointment.assignedStaff?.toString() === req.user._id.toString();
+
+    if (!canDeleteAny && !isAssignedStaff) {
+      console.log(
+        `❌ Staff ${req.user._id} not authorized to delete appointment ${id}`
+      );
+      return res.status(403).json({
+        success: false,
+        message:
+          "Access denied. You can only delete appointments assigned to you.",
+      });
+    }
+
     await Appointment.findByIdAndDelete(id);
+
+    console.log(`✅ Appointment ${id} deleted successfully`);
 
     res.json({
       success: true,
       message: "Appointment deleted successfully",
     });
   } catch (error) {
+    console.error("Delete appointment error:", error);
     res.status(500).json({
       success: false,
       message: "Server error",
@@ -490,6 +584,7 @@ router.get("/staff/clients", authMiddleware, staffOnly, async (req, res) => {
     const appointments = await Appointment.find(filter)
       .populate("customer", "username email phoneNumber profileImage")
       .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position")
       .sort({ appointmentDate: 1, appointmentTime: 1 });
 
     res.json({
@@ -497,6 +592,426 @@ router.get("/staff/clients", authMiddleware, staffOnly, async (req, res) => {
       message: "Client appointments retrieved successfully",
       data: appointments,
       count: appointments.length,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+});
+
+// ==================== STAFF APPOINTMENT ACTIONS ====================
+
+// @desc    Get appointments assigned to staff
+// @route   GET /api/appointments/staff/my-appointments
+// @access  Private (staff only)
+router.get(
+  "/staff/my-appointments",
+  authMiddleware,
+  staffOnly,
+  async (req, res) => {
+    try {
+      const { status, date, page = 1, limit = 10 } = req.query;
+      const staffId = req.user._id;
+
+      // Build filter object
+      const filter = { assignedStaff: staffId };
+      if (status && status !== "all") filter.status = status;
+      if (date) {
+        const startDate = new Date(date);
+        const endDate = new Date(date);
+        endDate.setDate(endDate.getDate() + 1);
+        filter.appointmentDate = { $gte: startDate, $lt: endDate };
+      }
+
+      const skip = (page - 1) * limit;
+
+      const appointments = await Appointment.find(filter)
+        .populate(
+          "customer",
+          "username firstName email phoneNumber profileImage"
+        )
+        .populate("service", "name duration priceRange category")
+        .sort({ appointmentDate: 1, appointmentTime: 1 })
+        .skip(skip)
+        .limit(Number.parseInt(limit));
+
+      const total = await Appointment.countDocuments(filter);
+
+      res.json({
+        success: true,
+        message: "Staff appointments retrieved successfully",
+        data: appointments,
+        pagination: {
+          page: Number.parseInt(page),
+          limit: Number.parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Server error",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// @desc    Get appointments for specific staff member - NEW ROUTE
+// @route   GET /api/appointments/staff/:staffId
+// @access  Private (staff only)
+router.get("/staff/:staffId", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { status, date, page = 1, limit = 50 } = req.query;
+
+    if (!mongoose.Types.ObjectId.isValid(staffId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid staff ID",
+      });
+    }
+
+    // Build filter object
+    const filter = { assignedStaff: staffId };
+    if (status && status !== "all") filter.status = status;
+    if (date) {
+      const startDate = new Date(date);
+      const endDate = new Date(date);
+      endDate.setDate(endDate.getDate() + 1);
+      filter.appointmentDate = { $gte: startDate, $lt: endDate };
+    }
+
+    const skip = (page - 1) * limit;
+
+    const appointments = await Appointment.find(filter)
+      .populate("customer", "username firstName email phoneNumber profileImage")
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position")
+      .sort({ appointmentDate: 1, appointmentTime: 1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Appointment.countDocuments(filter);
+
+    res.json({
+      success: true,
+      message: "Staff appointments retrieved successfully",
+      data: appointments,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error("Get staff appointments error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+});
+
+// @desc    Staff marks appointment as completed - FIXED ENDPOINT
+// @route   PUT /api/appointments/staff/:id/complete
+// @access  Private (staff only)
+router.put(
+  "/staff/:id/complete",
+  authMiddleware,
+  staffOnly,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { staffNotes } = req.body;
+      const staffId = req.user._id;
+
+      console.log(`🔄 Staff ${staffId} completing appointment: ${id}`);
+
+      const appointment = await Appointment.findById(id);
+
+      if (!appointment) {
+        console.log(`❌ Appointment ${id} not found`);
+        return res.status(404).json({
+          success: false,
+          message: "Appointment not found",
+        });
+      }
+
+      // Check if staff is assigned to this appointment
+      if (appointment.assignedStaff?.toString() !== staffId.toString()) {
+        console.log(`❌ Staff ${staffId} not assigned to appointment ${id}`);
+        return res.status(403).json({
+          success: false,
+          message:
+            "Access denied. You can only complete appointments assigned to you.",
+        });
+      }
+
+      if (appointment.status !== "upcoming") {
+        console.log(
+          `❌ Appointment ${id} is not upcoming, status: ${appointment.status}`
+        );
+        return res.status(400).json({
+          success: false,
+          message: "Only upcoming appointments can be marked as completed",
+        });
+      }
+
+      // Update appointment
+      appointment.status = "completed";
+      appointment.completedBy = staffId;
+      appointment.paymentStatus = "paid";
+      if (staffNotes) {
+        appointment.staffNotes = staffNotes;
+      }
+
+      const updatedAppointment = await appointment.save();
+
+      // Update leaderboard points for completed service
+      try {
+        const Leaderboard = require("../models/Leaderboards.js");
+        await Leaderboard.updateAppointmentCompletion(
+          staffId,
+          appointment.totalAmount || 0,
+          appointment.service?.category || "standard"
+        );
+      } catch (leaderboardError) {
+        console.error("Error updating leaderboard:", leaderboardError);
+        // Don't fail the request if leaderboard update fails
+      }
+
+      // Track appointment completion activity
+      await notificationService.trackUserActivity(
+        appointment.customer,
+        "appointment_completed",
+        {
+          appointmentId: appointment._id,
+          serviceId: appointment.service,
+          completedBy: staffId,
+          staffNotes: staffNotes,
+        }
+      );
+
+      console.log(`✅ Appointment ${id} marked as completed successfully`);
+
+      res.json({
+        success: true,
+        message: "Appointment marked as completed successfully",
+        data: updatedAppointment,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Server error",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// @desc    Staff cancels appointment - FIXED ENDPOINT
+// @route   PUT /api/appointments/staff/:id/cancel
+// @access  Private (staff only)
+router.put("/staff/:id/cancel", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { cancellationReason, staffNotes } = req.body;
+    const staffId = req.user._id;
+
+    const appointment = await Appointment.findById(id);
+
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found",
+      });
+    }
+
+    // Check if staff is assigned to this appointment or has permission to cancel any
+    const canCancelAny = req.user.permissions?.includes(
+      "manage_all_appointments"
+    );
+    if (
+      !canCancelAny &&
+      appointment.assignedStaff?.toString() !== staffId.toString()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Access denied. You can only cancel appointments assigned to you.",
+      });
+    }
+
+    if (appointment.status === "cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "Appointment is already cancelled",
+      });
+    }
+
+    // Update appointment
+    appointment.status = "cancelled";
+    appointment.cancelledBy = "staff";
+    if (cancellationReason) {
+      appointment.cancellationReason = cancellationReason;
+    }
+    if (staffNotes) {
+      appointment.staffNotes = staffNotes;
+    }
+
+    const updatedAppointment = await appointment.save();
+    const populatedAppointment = await Appointment.findById(
+      updatedAppointment._id
+    )
+      .populate("customer", "username firstName email phoneNumber profileImage")
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    // Track appointment cancellation activity
+    await notificationService.trackUserActivity(
+      appointment.customer,
+      "appointment_cancelled",
+      {
+        appointmentId: appointment._id,
+        cancellationReason: cancellationReason,
+        cancelledBy: "staff",
+        staffNotes: staffNotes,
+      }
+    );
+
+    res.json({
+      success: true,
+      message: "Appointment cancelled successfully",
+      data: populatedAppointment,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+});
+
+// @desc    Staff updates appointment notes
+// @route   PUT /api/appointments/staff/:id/notes
+// @access  Private (staff only)
+router.put("/staff/:id/notes", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { staffNotes } = req.body;
+    const staffId = req.user._id;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointment = await Appointment.findById(id);
+
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found",
+      });
+    }
+
+    // Check if staff is assigned to this appointment
+    if (appointment.assignedStaff?.toString() !== staffId.toString()) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Access denied. You can only update notes for appointments assigned to you.",
+      });
+    }
+
+    appointment.staffNotes = staffNotes || "";
+
+    const updatedAppointment = await appointment.save();
+    const populatedAppointment = await Appointment.findById(
+      updatedAppointment._id
+    )
+      .populate("customer", "username firstName email phoneNumber profileImage")
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    res.json({
+      success: true,
+      message: "Appointment notes updated successfully",
+      data: populatedAppointment,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server error",
+      error: error.message,
+    });
+  }
+});
+
+// @desc    Assign staff to appointment
+// @route   PUT /api/appointments/staff/:id/assign
+// @access  Private (staff only - with permission)
+router.put("/staff/:id/assign", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { staffId } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(staffId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid staff ID",
+      });
+    }
+
+    const appointment = await Appointment.findById(id);
+
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found",
+      });
+    }
+
+    // Check if current user has permission to assign staff
+    const canAssignStaff = req.user.permissions?.includes("assign_staff");
+    if (!canAssignStaff) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. You don't have permission to assign staff.",
+      });
+    }
+
+    appointment.assignedStaff = staffId;
+
+    const updatedAppointment = await appointment.save();
+    const populatedAppointment = await Appointment.findById(
+      updatedAppointment._id
+    )
+      .populate("customer", "username firstName email phoneNumber profileImage")
+      .populate("service", "name duration priceRange category")
+      .populate("assignedStaff", "username profileImage position");
+
+    res.json({
+      success: true,
+      message: "Staff assigned to appointment successfully",
+      data: populatedAppointment,
     });
   } catch (error) {
     res.status(500).json({

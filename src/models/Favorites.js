@@ -1,3 +1,4 @@
+// models/Favorites.js - ENHANCED for both Customer and Staff
 import mongoose from "mongoose";
 
 const favoriteSchema = new mongoose.Schema({
@@ -8,13 +9,12 @@ const favoriteSchema = new mongoose.Schema({
   },
   itemType: {
     type: String,
-    enum: ["Product", "Service"], // ✅ Capitalized to match model names
-    default: "Product",
+    enum: ["Product", "Service", "LearningModule", "Stylist"],
     required: true,
   },
   itemId: {
     type: mongoose.Schema.Types.ObjectId,
-    refPath: "itemType", // This will now look for "Product" or "Service" models
+    refPath: "itemType",
     required: true,
   },
   createdAt: {
@@ -25,6 +25,18 @@ const favoriteSchema = new mongoose.Schema({
 
 // Create compound index to prevent duplicate favorites
 favoriteSchema.index({ userId: 1, itemType: 1, itemId: 1 }, { unique: true });
+
+// Static method to get user favorites by type
+favoriteSchema.statics.getUserFavorites = function (userId, itemType) {
+  return this.find({ userId, itemType })
+    .populate("itemId")
+    .sort({ createdAt: -1 });
+};
+
+// Static method to check if item is favorited
+favoriteSchema.statics.isFavorited = function (userId, itemType, itemId) {
+  return this.findOne({ userId, itemType, itemId });
+};
 
 const Favorite = mongoose.model("Favorite", favoriteSchema);
 

@@ -1,13 +1,15 @@
+// routes/attendanceRoutes.js - COMPLETE UPDATED WITH BREAK FUNCTIONALITY
 import express from "express";
 import Attendance from "../models/Attendance.js";
-import { authMiddleware } from "../middleware/auth.js";
+import Leaderboard from "../models/Leaderboards.js";
+import { authMiddleware, staffOnly } from "../middleware/auth.js";
 
 const router = express.Router();
 
 // Get attendance dashboard data
-router.get("/dashboard/:userId", authMiddleware, async (req, res) => {
+router.get("/dashboard", authMiddleware, staffOnly, async (req, res) => {
   try {
-    const { userId } = req.params;
+    const userId = req.user._id;
     const {
       year = new Date().getFullYear(),
       month = new Date().getMonth() + 1,
@@ -42,19 +44,25 @@ router.get("/dashboard/:userId", authMiddleware, async (req, res) => {
       date: { $gte: today, $lt: tomorrow },
     });
 
+    // Determine current status including break status
+    let currentStatus = "not-started";
+    if (todayAttendance) {
+      if (todayAttendance.status === "on-break") {
+        currentStatus = "on-break";
+      } else if (todayAttendance.clockInTime && !todayAttendance.clockOutTime) {
+        currentStatus = "clocked-in";
+      } else if (todayAttendance.clockOutTime) {
+        currentStatus = "clocked-out";
+      }
+    }
+
     res.json({
       success: true,
       data: {
         monthly: monthlyData,
         recent: recentAttendance,
         today: todayAttendance,
-        currentStatus: todayAttendance
-          ? todayAttendance.clockInTime && !todayAttendance.clockOutTime
-            ? "clocked-in"
-            : todayAttendance.clockOutTime
-            ? "clocked-out"
-            : "not-started"
-          : "not-started",
+        currentStatus: currentStatus,
       },
     });
   } catch (error) {
@@ -66,10 +74,11 @@ router.get("/dashboard/:userId", authMiddleware, async (req, res) => {
   }
 });
 
-// Clock in
-router.post("/clock-in", authMiddleware, async (req, res) => {
+// Clock in with GPS validation (UPDATED)
+router.post("/clock-in", authMiddleware, staffOnly, async (req, res) => {
   try {
-    const { userId, latitude, longitude, address } = req.body;
+    const userId = req.user._id;
+    const { latitude, longitude, address } = req.body;
 
     if (!latitude || !longitude) {
       return res.status(400).json({
@@ -78,15 +87,24 @@ router.post("/clock-in", authMiddleware, async (req, res) => {
       });
     }
 
-    // Check if user is within salon radius
-    const locationCheck = Attendance.isWithinSalonRadius(latitude, longitude);
+    // Enhanced GPS validation with 5km radius
+    const locationCheck = Attendance.isWithinSalonRadius(
+      latitude,
+      longitude,
+      14.5995,
+      120.9842,
+      5
+    ); // 5km radius
 
     if (!locationCheck.isWithin) {
       return res.status(400).json({
         success: false,
         message: "Clock-In Failed!",
-        details: `Oops! You're not in the salon yet. Distance: ${locationCheck.distanceMeters}m away from Sandradee Salon. Manager Alert: Your late clock-in will be logged. Better hurry—your next client waits!`,
-        distance: locationCheck.distanceMeters,
+        details: `Oops! You're not in the salon yet. Distance: ${locationCheck.distance.toFixed(
+          1
+        )}km away from SandreaLee Salon. Manager Alert: Your late clock-in will be logged. Better hurry—your next client waits!`,
+        distance: locationCheck.distance,
+        distanceMeters: locationCheck.distanceMeters,
         isValidLocation: false,
       });
     }
@@ -117,29 +135,53 @@ router.post("/clock-in", authMiddleware, async (req, res) => {
       });
     }
 
-    attendance.clockInTime = new Date();
+    const currentTime = new Date();
+    attendance.clockInTime = currentTime;
     attendance.clockInLocation = {
       latitude: latitude,
       longitude: longitude,
-      address: address || "Salon Location",
+      address: address || "SandreaLee Salon Location",
     };
     attendance.isValidLocation.clockIn = true;
     attendance.status = "present";
 
-    // Check if late (assuming work starts at 9 AM)
+    // Enhanced late check (assuming work starts at 9 AM)
     const workStartTime = new Date();
     workStartTime.setHours(9, 0, 0, 0);
-    if (attendance.clockInTime > workStartTime) {
+
+    const isOnTime = currentTime <= workStartTime;
+
+    // UPDATE LEADERBOARD - NEW INTEGRATION
+    try {
+      await LeaderboardService.updateAttendance(userId, 'clock-in', isOnTime);
+    } catch (leaderboardError) {
+      console.error('Error updating leaderboard:', leaderboardError);
+      // Don't fail the request if leaderboard update fails
+    }
+
+    if (!isOnTime) {
+      // Calculate minutes late
+      const minutesLate = Math.floor((currentTime - workStartTime) / (1000 * 60));
       attendance.status = "late";
+      
+      await attendance.save();
+      return res.json({
+        success: true,
+        message: "You're In! (Late)",
+        details: `Time In: ${attendance.clockInTime.toLocaleTimeString()}\nLocation Verified: You're at the salon!\nNote: You are ${minutesLate} minutes late. This will be recorded.`,
+        data: attendance,
+        isLate: true,
+        minutesLate: minutesLate,
+      });
     }
 
     await attendance.save();
-
     res.json({
       success: true,
       message: "You're In!",
       details: `Time In: ${attendance.clockInTime.toLocaleTimeString()}\nLocation Verified: You're at the salon!`,
       data: attendance,
+      isLate: false,
     });
   } catch (error) {
     res.status(500).json({
@@ -150,10 +192,10 @@ router.post("/clock-in", authMiddleware, async (req, res) => {
   }
 });
 
-// Clock out
-router.post("/clock-out", authMiddleware, async (req, res) => {
+// Clock out with location validation
+router.post("/clock-out", authMiddleware, staffOnly, async (req, res) => {
   try {
-    const { userId, latitude, longitude, address } = req.body;
+    const userId = req.user._id;
 
     // Find today's attendance record
     const today = new Date();
@@ -180,10 +222,18 @@ router.post("/clock-out", authMiddleware, async (req, res) => {
       });
     }
 
+    const { latitude, longitude, address } = req.body;
+
     // Check location if coordinates provided
     let isValidLocation = true;
     if (latitude && longitude) {
-      const locationCheck = Attendance.isWithinSalonRadius(latitude, longitude);
+      const locationCheck = Attendance.isWithinSalonRadius(
+        latitude,
+        longitude,
+        14.5995,
+        120.9842,
+        5
+      );
       isValidLocation = locationCheck.isWithin;
     }
 
@@ -192,7 +242,7 @@ router.post("/clock-out", authMiddleware, async (req, res) => {
       attendance.clockOutLocation = {
         latitude: latitude,
         longitude: longitude,
-        address: address || "Salon Location",
+        address: address || "SandreaLee Salon Location",
       };
       attendance.isValidLocation.clockOut = isValidLocation;
     }
@@ -202,13 +252,35 @@ router.post("/clock-out", authMiddleware, async (req, res) => {
 
     await attendance.save();
 
+    // Update leaderboard
+    const leaderboardProfile = await Leaderboard.findOne({ userId });
+    if (leaderboardProfile) {
+      leaderboardProfile.attendanceScore += 15;
+      leaderboardProfile.streaks.attendance.current += 1;
+      if (
+        leaderboardProfile.streaks.attendance.current >
+        leaderboardProfile.streaks.attendance.longest
+      ) {
+        leaderboardProfile.streaks.attendance.longest =
+          leaderboardProfile.streaks.attendance.current;
+      }
+      await leaderboardProfile.save();
+    }
+
+    const workingHours = Math.floor(attendance.workingHours / 60);
+    const workingMinutes = attendance.workingHours % 60;
+    const netWorkingHours = Math.floor(attendance.netWorkingHours / 60);
+    const netWorkingMinutes = attendance.netWorkingHours % 60;
+
     res.json({
       success: true,
       message: "Successfully clocked out",
+      details: `Time Out: ${attendance.clockOutTime.toLocaleTimeString()}\nTotal Hours: ${workingHours}h ${workingMinutes}m\nNet Hours (minus breaks): ${netWorkingHours}h ${netWorkingMinutes}m`,
       data: attendance,
-      workingHours: `${Math.floor(attendance.workingHours / 60)}h ${
-        attendance.workingHours % 60
-      }m`,
+      workingHours: `${workingHours}h ${workingMinutes}m`,
+      netWorkingHours: `${netWorkingHours}h ${netWorkingMinutes}m`,
+      totalMinutes: attendance.workingHours,
+      netMinutes: attendance.netWorkingHours,
     });
   } catch (error) {
     res.status(500).json({
@@ -219,10 +291,241 @@ router.post("/clock-out", authMiddleware, async (req, res) => {
   }
 });
 
-// Get attendance history
-router.get("/history/:userId", authMiddleware, async (req, res) => {
+// ADD BREAK ROUTES
+
+// Start break
+router.post("/break-start", authMiddleware, staffOnly, async (req, res) => {
   try {
-    const { userId } = req.params;
+    const userId = req.user._id;
+    const { breakType = "lunch", latitude, longitude, address } = req.body;
+
+    // Find today's attendance record
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    let attendance = await Attendance.findOne({
+      userId: userId,
+      date: { $gte: today, $lt: tomorrow },
+    });
+
+    if (!attendance || !attendance.clockInTime) {
+      return res.status(400).json({
+        success: false,
+        message: "You need to clock in first before taking a break",
+      });
+    }
+
+    if (attendance.clockOutTime) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot take break after clocking out",
+      });
+    }
+
+    // Check if already on break
+    const activeBreak = attendance.breaks.find(
+      (breakItem) => !breakItem.breakEnd
+    );
+    if (activeBreak) {
+      return res.status(400).json({
+        success: false,
+        message: "You are already on a break",
+      });
+    }
+
+    // Validate location if provided
+    let isValidLocation = true;
+    let locationData = null;
+
+    if (latitude && longitude) {
+      const locationCheck = Attendance.isWithinSalonRadius(
+        latitude,
+        longitude,
+        14.5995,
+        120.9842,
+        5
+      );
+      isValidLocation = locationCheck.isWithin;
+      locationData = {
+        latitude,
+        longitude,
+        address: address || "SandreaLee Salon Location",
+      };
+    }
+
+    await attendance.startBreak(breakType, locationData);
+
+    // Update break location validity if location was provided
+    if (locationData) {
+      const lastBreakIndex = attendance.breaks.length - 1;
+      attendance.breaks[lastBreakIndex].isValidLocation = isValidLocation;
+      await attendance.save();
+    }
+
+    res.json({
+      success: true,
+      message: "Break started successfully",
+      data: {
+        breakStart: attendance.breaks[attendance.breaks.length - 1].breakStart,
+        breakType: breakType,
+        isValidLocation: isValidLocation,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error starting break",
+      error: error.message,
+    });
+  }
+});
+
+// End break
+router.post("/break-end", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const { latitude, longitude, address } = req.body;
+
+    // Find today's attendance record
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const attendance = await Attendance.findOne({
+      userId: userId,
+      date: { $gte: today, $lt: tomorrow },
+    });
+
+    if (!attendance) {
+      return res.status(400).json({
+        success: false,
+        message: "No attendance record found for today",
+      });
+    }
+
+    // Check if there's an active break
+    const activeBreak = attendance.breaks.find(
+      (breakItem) => !breakItem.breakEnd
+    );
+    if (!activeBreak) {
+      return res.status(400).json({
+        success: false,
+        message: "No active break found",
+      });
+    }
+
+    // Validate location if provided
+    let isValidLocation = true;
+    let locationData = null;
+
+    if (latitude && longitude) {
+      const locationCheck = Attendance.isWithinSalonRadius(
+        latitude,
+        longitude,
+        14.5995,
+        120.9842,
+        5
+      );
+      isValidLocation = locationCheck.isWithin;
+      locationData = {
+        latitude,
+        longitude,
+        address: address || "SandreaLee Salon Location",
+      };
+    }
+
+    await attendance.endBreak(locationData);
+
+    // Update break location validity if location was provided
+    if (locationData) {
+      const endedBreak = attendance.breaks.find(
+        (breakItem) => breakItem.breakEnd && !breakItem.breakLocation?.latitude
+      );
+      if (endedBreak) {
+        endedBreak.breakLocation = locationData;
+        endedBreak.isValidLocation = isValidLocation;
+        await attendance.save();
+      }
+    }
+
+    const lastBreak = attendance.breaks[attendance.breaks.length - 1];
+
+    res.json({
+      success: true,
+      message: "Break ended successfully",
+      data: {
+        breakDuration: lastBreak.breakDuration,
+        totalBreakTime: attendance.totalBreakTime,
+        netWorkingHours: attendance.netWorkingHours,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error ending break",
+      error: error.message,
+    });
+  }
+});
+
+// Get break status
+router.get("/break-status", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const attendance = await Attendance.findOne({
+      userId: userId,
+      date: { $gte: today, $lt: tomorrow },
+    });
+
+    if (!attendance) {
+      return res.json({
+        success: true,
+        data: {
+          onBreak: false,
+          activeBreak: null,
+          totalBreaksToday: 0,
+          totalBreakTime: 0,
+          breaks: [],
+        },
+      });
+    }
+
+    const activeBreak = attendance.breaks.find(
+      (breakItem) => !breakItem.breakEnd
+    );
+
+    res.json({
+      success: true,
+      data: {
+        onBreak: !!activeBreak,
+        activeBreak: activeBreak,
+        totalBreaksToday: attendance.breaks.length,
+        totalBreakTime: attendance.totalBreakTime,
+        breaks: attendance.breaks,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching break status",
+      error: error.message,
+    });
+  }
+});
+
+// Get attendance history
+router.get("/history", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const userId = req.user._id;
     const { page = 1, limit = 30, startDate, endDate } = req.query;
 
     const query = { userId: userId };
@@ -237,8 +540,7 @@ router.get("/history/:userId", authMiddleware, async (req, res) => {
     const attendance = await Attendance.find(query)
       .sort({ date: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .populate("userId", "username profileImage");
+      .skip((page - 1) * limit);
 
     const total = await Attendance.countDocuments(query);
 
@@ -261,9 +563,9 @@ router.get("/history/:userId", authMiddleware, async (req, res) => {
 });
 
 // Get monthly attendance chart data
-router.get("/monthly-chart/:userId", authMiddleware, async (req, res) => {
+router.get("/monthly-chart", authMiddleware, staffOnly, async (req, res) => {
   try {
-    const { userId } = req.params;
+    const userId = req.user._id;
     const { year = new Date().getFullYear() } = req.query;
 
     const monthlyData = [];
@@ -280,8 +582,10 @@ router.get("/monthly-chart/:userId", authMiddleware, async (req, res) => {
         }),
         attendancePercentage: data.attendancePercentage,
         present: data.present,
+        late: data.late,
         absent: data.absent,
         workingDays: data.workingDays,
+        totalBreakTime: data.totalBreakTime,
       });
     }
 
@@ -293,6 +597,76 @@ router.get("/monthly-chart/:userId", authMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error fetching monthly chart data",
+      error: error.message,
+    });
+  }
+});
+
+// Get monthly stats
+router.get("/monthly-stats", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const {
+      year = new Date().getFullYear(),
+      month = new Date().getMonth() + 1,
+    } = req.query;
+
+    const monthlyData = await Attendance.getMonthlyAttendance(
+      userId,
+      Number.parseInt(year),
+      Number.parseInt(month)
+    );
+
+    res.json({
+      success: true,
+      data: monthlyData,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching monthly stats",
+      error: error.message,
+    });
+  }
+});
+
+// Get current clock status
+router.get("/status", authMiddleware, staffOnly, async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const todayAttendance = await Attendance.findOne({
+      userId: userId,
+      date: { $gte: today, $lt: tomorrow },
+    });
+
+    let currentStatus = "not-started";
+    if (todayAttendance) {
+      if (todayAttendance.status === "on-break") {
+        currentStatus = "on-break";
+      } else if (todayAttendance.clockInTime && !todayAttendance.clockOutTime) {
+        currentStatus = "clocked-in";
+      } else if (todayAttendance.clockOutTime) {
+        currentStatus = "clocked-out";
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        status: currentStatus,
+        record: todayAttendance,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching attendance status",
       error: error.message,
     });
   }

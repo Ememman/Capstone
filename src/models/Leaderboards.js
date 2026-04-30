@@ -1,3 +1,4 @@
+// models/Leaderboards.js - UPDATED
 import mongoose from "mongoose";
 
 const leaderboardSchema = new mongoose.Schema({
@@ -5,9 +6,8 @@ const leaderboardSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
     required: true,
-    // ❌ removed unique: true to prevent duplicate index
   },
-  // Performance Metrics
+  // Performance Metrics - Daily, Weekly, Monthly tracking
   totalPoints: {
     type: Number,
     default: 0,
@@ -19,6 +19,33 @@ const leaderboardSchema = new mongoose.Schema({
   weeklyPoints: {
     type: Number,
     default: 0,
+  },
+  dailyPoints: {
+    type: Number,
+    default: 0,
+  },
+  // Daily tracking for better granularity
+  dailyStats: {
+    date: {
+      type: Date,
+      default: Date.now,
+    },
+    points: {
+      type: Number,
+      default: 0,
+    },
+    quizzesCompleted: {
+      type: Number,
+      default: 0,
+    },
+    appointmentsCompleted: {
+      type: Number,
+      default: 0,
+    },
+    attendancePoints: {
+      type: Number,
+      default: 0,
+    },
   },
   // Attendance Metrics
   attendanceScore: {
@@ -47,6 +74,10 @@ const leaderboardSchema = new mongoose.Schema({
       type: Number,
       default: 0,
     },
+    daily: {
+      type: Number,
+      default: 0,
+    },
   },
   customerRatings: {
     average: {
@@ -64,13 +95,45 @@ const leaderboardSchema = new mongoose.Schema({
       default: 0,
     },
   },
-  // Learning Metrics
+  // Learning Metrics - Enhanced daily tracking
   learningModulesCompleted: {
     total: {
       type: Number,
       default: 0,
     },
     monthly: {
+      type: Number,
+      default: 0,
+    },
+    daily: {
+      type: Number,
+      default: 0,
+    },
+  },
+  quizzesCompleted: {
+    total: {
+      type: Number,
+      default: 0,
+    },
+    monthly: {
+      type: Number,
+      default: 0,
+    },
+    daily: {
+      type: Number,
+      default: 0,
+    },
+  },
+  quizPoints: {
+    total: {
+      type: Number,
+      default: 0,
+    },
+    monthly: {
+      type: Number,
+      default: 0,
+    },
+    daily: {
       type: Number,
       default: 0,
     },
@@ -90,6 +153,10 @@ const leaderboardSchema = new mongoose.Schema({
       default: 0,
     },
     weeklyRevenue: {
+      type: Number,
+      default: 0,
+    },
+    dailyRevenue: {
       type: Number,
       default: 0,
     },
@@ -135,6 +202,10 @@ const leaderboardSchema = new mongoose.Schema({
       type: Number,
       default: 0,
     },
+    daily: {
+      type: Number,
+      default: 0,
+    },
   },
   previousRank: {
     overall: {
@@ -146,6 +217,10 @@ const leaderboardSchema = new mongoose.Schema({
       default: 0,
     },
     weekly: {
+      type: Number,
+      default: 0,
+    },
+    daily: {
       type: Number,
       default: 0,
     },
@@ -192,6 +267,10 @@ const leaderboardSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+  lastDailyReset: {
+    type: Date,
+    default: Date.now,
+  },
   // Performance History
   performanceHistory: [
     {
@@ -223,10 +302,122 @@ const leaderboardSchema = new mongoose.Schema({
 leaderboardSchema.index({ totalPoints: -1 });
 leaderboardSchema.index({ monthlyPoints: -1 });
 leaderboardSchema.index({ weeklyPoints: -1 });
-leaderboardSchema.index({ userId: 1 }, { unique: true }); // ✅ keep this only once
+leaderboardSchema.index({ dailyPoints: -1 });
+leaderboardSchema.index({ userId: 1 }, { unique: true });
 leaderboardSchema.index({ isActive: 1 });
 
-// Calculate total points based on various metrics
+// NEW METHODS FOR POINT TRACKING
+
+// Add quiz points
+leaderboardSchema.methods.addQuizPoints = function (
+  score,
+  pointsEarned,
+  isDaily = true
+) {
+  this.quizPoints.total += pointsEarned;
+  this.quizPoints.monthly += pointsEarned;
+
+  if (isDaily) {
+    this.quizPoints.daily += pointsEarned;
+    this.dailyStats.points += pointsEarned;
+    this.dailyStats.quizzesCompleted += 1;
+  }
+
+  this.quizzesCompleted.total += 1;
+  this.quizzesCompleted.monthly += 1;
+  if (isDaily) {
+    this.quizzesCompleted.daily += 1;
+  }
+
+  // Update learning streak
+  this.streaks.learning.current += 1;
+  if (this.streaks.learning.current > this.streaks.learning.longest) {
+    this.streaks.learning.longest = this.streaks.learning.current;
+  }
+
+  return this.save();
+};
+
+// Add appointment completion points
+leaderboardSchema.methods.addAppointmentPoints = function (
+  revenue,
+  pointsEarned = 0
+) {
+  const appointmentPoints =
+    pointsEarned > 0 ? pointsEarned : Math.floor(revenue / 100) * 5;
+
+  this.servicesCompleted.total += 1;
+  this.servicesCompleted.monthly += 1;
+  this.servicesCompleted.daily += 1;
+
+  this.salesPerformance.totalRevenue += revenue;
+  this.salesPerformance.monthlyRevenue += revenue;
+  this.salesPerformance.dailyRevenue += revenue;
+
+  this.dailyStats.points += appointmentPoints;
+  this.dailyStats.appointmentsCompleted += 1;
+
+  return this.save();
+};
+
+// Add attendance points
+leaderboardSchema.methods.addAttendancePoints = function (
+  points,
+  type = "clock-in"
+) {
+  if (type === "clock-in") {
+    this.attendanceScore += points;
+    this.dailyStats.attendancePoints += points;
+    this.dailyStats.points += points;
+
+    // Update attendance streak
+    this.streaks.attendance.current += 1;
+    if (this.streaks.attendance.current > this.streaks.attendance.longest) {
+      this.streaks.attendance.longest = this.streaks.attendance.current;
+    }
+  } else if (type === "punctuality") {
+    this.punctualityScore += points;
+    this.dailyStats.points += points;
+
+    // Update punctuality streak
+    this.streaks.punctuality.current += 1;
+    if (this.streaks.punctuality.current > this.streaks.punctuality.longest) {
+      this.streaks.punctuality.longest = this.streaks.punctuality.current;
+    }
+  }
+
+  return this.save();
+};
+
+// Reset daily stats
+leaderboardSchema.methods.resetDailyStats = function () {
+  this.dailyStats = {
+    date: new Date(),
+    points: 0,
+    quizzesCompleted: 0,
+    appointmentsCompleted: 0,
+    attendancePoints: 0,
+  };
+  this.quizPoints.daily = 0;
+  this.quizzesCompleted.daily = 0;
+  this.servicesCompleted.daily = 0;
+  this.salesPerformance.dailyRevenue = 0;
+
+  return this.save();
+};
+
+// Check if daily reset is needed
+leaderboardSchema.methods.checkDailyReset = function () {
+  const today = new Date().toDateString();
+  const lastReset = new Date(this.dailyStats.date).toDateString();
+
+  if (today !== lastReset) {
+    return this.resetDailyStats();
+  }
+  return Promise.resolve(this);
+};
+
+// Existing methods remain the same...
 leaderboardSchema.methods.calculateTotalPoints = function () {
   let points = 0;
 
@@ -238,8 +429,10 @@ leaderboardSchema.methods.calculateTotalPoints = function () {
   points += this.servicesCompleted.total * 5;
   points += this.customerRatings.average * 20;
 
-  // Learning points (max 200 points)
+  // Learning points (max 300 points)
   points += this.learningModulesCompleted.total * 10;
+  points += this.quizzesCompleted.total * 8;
+  points += this.quizPoints.total * 1;
   points += this.certificationsEarned * 50;
 
   // Sales points (max 300 points)
@@ -255,7 +448,6 @@ leaderboardSchema.methods.calculateTotalPoints = function () {
   return this.totalPoints;
 };
 
-// Update monthly points
 leaderboardSchema.methods.calculateMonthlyPoints = function () {
   let points = 0;
 
@@ -264,10 +456,35 @@ leaderboardSchema.methods.calculateMonthlyPoints = function () {
   points += this.servicesCompleted.monthly * 5;
   points += this.customerRatings.average * 20;
   points += this.learningModulesCompleted.monthly * 10;
+  points += this.quizzesCompleted.monthly * 8;
+  points += this.quizPoints.monthly * 1;
   points += Math.floor(this.salesPerformance.monthlyRevenue / 1000) * 10;
 
   this.monthlyPoints = Math.floor(points);
   return this.monthlyPoints;
+};
+
+leaderboardSchema.methods.calculateWeeklyPoints = function () {
+  let points = 0;
+
+  points += this.servicesCompleted.weekly * 5;
+  points += this.customerRatings.average * 15;
+  points += Math.floor(this.salesPerformance.weeklyRevenue / 1000) * 10;
+
+  this.weeklyPoints = Math.floor(points);
+  return this.weeklyPoints;
+};
+
+leaderboardSchema.methods.calculateDailyPoints = function () {
+  let points = 0;
+
+  points += this.servicesCompleted.daily * 5;
+  points += this.quizzesCompleted.daily * 8;
+  points += this.quizPoints.daily * 1;
+  points += Math.floor(this.salesPerformance.dailyRevenue / 100) * 2;
+
+  this.dailyPoints = Math.floor(points);
+  return this.dailyPoints;
 };
 
 // Award badge
@@ -346,6 +563,19 @@ leaderboardSchema.methods.checkAndAwardBadges = function () {
   }
 
   if (
+    this.quizzesCompleted.total >= 50 &&
+    !this.badges.find((b) => b.name === "Quiz Master")
+  ) {
+    this.awardBadge({
+      name: "Quiz Master",
+      description: "50 quizzes completed",
+      icon: "trophy",
+      category: "learning",
+    });
+    newBadges.push("Quiz Master");
+  }
+
+  if (
     this.salesPerformance.totalRevenue >= 50000 &&
     !this.badges.find((b) => b.name === "Sales Star")
   ) {
@@ -375,6 +605,9 @@ leaderboardSchema.statics.getLeaderboard = async function (
     case "weekly":
       sortField = { weeklyPoints: -1 };
       break;
+    case "daily":
+      sortField = { dailyPoints: -1 };
+      break;
     case "attendance":
       sortField = { attendanceScore: -1 };
       break;
@@ -385,7 +618,7 @@ leaderboardSchema.statics.getLeaderboard = async function (
       };
       break;
     case "learning":
-      sortField = { "learningModulesCompleted.total": -1 };
+      sortField = { "quizzesCompleted.total": -1 };
       break;
     case "sales":
       sortField = { "salesPerformance.totalRevenue": -1 };
@@ -423,6 +656,10 @@ leaderboardSchema.statics.updateAllRankings = async function () {
     .sort({ weeklyPoints: -1 })
     .select("_id currentRank previousRank");
 
+  const dailyLeaderboard = await this.find({ isActive: true })
+    .sort({ dailyPoints: -1 })
+    .select("_id currentRank previousRank");
+
   for (let i = 0; i < overallLeaderboard.length; i++) {
     const entry = overallLeaderboard[i];
     entry.previousRank.overall = entry.currentRank.overall;
@@ -443,9 +680,16 @@ leaderboardSchema.statics.updateAllRankings = async function () {
     entry.currentRank.weekly = i + 1;
     await entry.save();
   }
+
+  for (let i = 0; i < dailyLeaderboard.length; i++) {
+    const entry = dailyLeaderboard[i];
+    entry.previousRank.daily = entry.currentRank.daily;
+    entry.currentRank.daily = i + 1;
+    await entry.save();
+  }
 };
 
-// Reset monthly/weekly points
+// Reset monthly/weekly/daily points
 leaderboardSchema.statics.resetPeriodPoints = async function (
   period = "monthly"
 ) {
@@ -459,6 +703,8 @@ leaderboardSchema.statics.resetPeriodPoints = async function (
           monthlyPoints: 0,
           "servicesCompleted.monthly": 0,
           "learningModulesCompleted.monthly": 0,
+          "quizzesCompleted.monthly": 0,
+          "quizPoints.monthly": 0,
           "salesPerformance.monthlyRevenue": 0,
           lastMonthlyReset: now,
         },
@@ -476,6 +722,114 @@ leaderboardSchema.statics.resetPeriodPoints = async function (
         },
       }
     );
+  } else if (period === "daily") {
+    await this.updateMany(
+      { isActive: true },
+      {
+        $set: {
+          dailyPoints: 0,
+          "servicesCompleted.daily": 0,
+          "quizzesCompleted.daily": 0,
+          "quizPoints.daily": 0,
+          "salesPerformance.dailyRevenue": 0,
+          lastDailyReset: now,
+        },
+      }
+    );
+  }
+};
+
+// NEW STATIC METHODS FOR INTEGRATION
+
+// Get or create leaderboard for user
+leaderboardSchema.statics.getOrCreateLeaderboard = async function (userId) {
+  let leaderboard = await this.findOne({ userId });
+
+  if (!leaderboard) {
+    leaderboard = new this({ userId });
+    await leaderboard.save();
+  }
+
+  // Check if daily reset is needed
+  await leaderboard.checkDailyReset();
+
+  return leaderboard;
+};
+
+// Update leaderboard from quiz completion
+leaderboardSchema.statics.updateFromQuiz = async function (
+  userId,
+  score,
+  pointsEarned = null
+) {
+  try {
+    const leaderboard = await this.getOrCreateLeaderboard(userId);
+    const calculatedPoints = pointsEarned || Math.floor(score / 10) * 5;
+
+    await leaderboard.addQuizPoints(score, calculatedPoints, true);
+    leaderboard.checkAndAwardBadges();
+
+    return leaderboard;
+  } catch (error) {
+    console.error("Error updating leaderboard from quiz:", error);
+    throw error;
+  }
+};
+
+// Update leaderboard from appointment completion
+leaderboardSchema.statics.updateFromAppointment = async function (
+  userId,
+  revenue,
+  serviceType = "standard"
+) {
+  try {
+    const leaderboard = await this.getOrCreateLeaderboard(userId);
+
+    let pointsEarned = Math.floor(revenue / 100) * 5;
+
+    // Bonus points for premium services
+    if (serviceType === "premium") {
+      pointsEarned += 20;
+    } else if (serviceType === "complex") {
+      pointsEarned += 15;
+    }
+
+    await leaderboard.addAppointmentPoints(revenue, pointsEarned);
+    leaderboard.checkAndAwardBadges();
+
+    return leaderboard;
+  } catch (error) {
+    console.error("Error updating leaderboard from appointment:", error);
+    throw error;
+  }
+};
+
+// Update leaderboard from attendance
+leaderboardSchema.statics.updateFromAttendance = async function (
+  userId,
+  action,
+  isOnTime = true
+) {
+  try {
+    const leaderboard = await this.getOrCreateLeaderboard(userId);
+
+    let points = 0;
+
+    if (action === "clock-in") {
+      points = isOnTime ? 15 : 5; // More points for being on time
+      await leaderboard.addAttendancePoints(points, "clock-in");
+
+      if (isOnTime) {
+        await leaderboard.addAttendancePoints(10, "punctuality");
+      }
+    }
+
+    leaderboard.checkAndAwardBadges();
+
+    return leaderboard;
+  } catch (error) {
+    console.error("Error updating leaderboard from attendance:", error);
+    throw error;
   }
 };
 
@@ -483,6 +837,8 @@ leaderboardSchema.pre("save", function (next) {
   this.updatedAt = Date.now();
   this.calculateTotalPoints();
   this.calculateMonthlyPoints();
+  this.calculateWeeklyPoints();
+  this.calculateDailyPoints();
   next();
 });
 

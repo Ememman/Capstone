@@ -1,4 +1,4 @@
-// models/User.js
+// models/User.js - COMPLETE UPDATED VERSION with FIXED delay system
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
@@ -18,7 +18,7 @@ const validatePasswordStrength = (password) => {
   }
 
   const checks = {
-    length: password.length >= 8 && password.length <= 128, // Increased max length for plain text
+    length: password.length >= 8 && password.length <= 128,
     lowercase: /[a-z]/.test(password),
     uppercase: /[A-Z]/.test(password),
     number: /\d/.test(password),
@@ -325,12 +325,25 @@ userSchema.pre("save", async function (next) {
 });
 
 /**
- * Compares a candidate password with the stored hash.
+ * ✅ FIXED: Compares a candidate password with the stored hash.
  * @param {string} candidatePassword - The password to compare.
  * @returns {Promise<boolean>} True if passwords match.
  */
 userSchema.methods.comparePassword = async function (candidatePassword) {
-  return await bcrypt.compare(candidatePassword, this.password);
+  try {
+    if (!this.password) {
+      console.log("❌ No password hash found for user:", this.username);
+      return false;
+    }
+
+    console.log("🔐 Comparing password for user:", this.username);
+    const isMatch = await bcrypt.compare(candidatePassword, this.password);
+    console.log("✅ Password comparison result:", isMatch);
+    return isMatch;
+  } catch (error) {
+    console.error("❌ Error comparing passwords:", error);
+    return false;
+  }
 };
 
 /**
@@ -340,49 +353,81 @@ userSchema.methods.comparePassword = async function (candidatePassword) {
  */
 userSchema.methods.checkPasswordStrength = validatePasswordStrength;
 
-/**
- * Handles failed login attempts and sets delays.
- * @returns {Promise<void>}
- */
+// ✅ FIXED: Updated handleFailedLogin method to match route logic
 userSchema.methods.handleFailedLogin = async function () {
-  this.security.failedLoginAttempts += 1;
-  this.security.lastFailedLogin = new Date();
-  let delaySeconds = 0;
-  const attempts = this.security.failedLoginAttempts;
+  try {
+    console.log("🔐 Handling failed login for user:", this.username);
 
-  if (attempts >= 1 && attempts <= 2) delaySeconds = 10;
-  else if (attempts >= 3 && attempts <= 4) delaySeconds = 20;
-  else if (attempts === 5) delaySeconds = 30;
-  else if (attempts >= 6 && attempts <= 7) delaySeconds = 45;
-  else if (attempts >= 8) delaySeconds = 60;
+    this.security.failedLoginAttempts =
+      (this.security.failedLoginAttempts || 0) + 1;
+    this.security.lastFailedLogin = new Date();
 
-  this.security.delaySeconds = delaySeconds;
-  this.security.nextAllowedLogin = new Date(Date.now() + delaySeconds * 1000);
-  await this.save({ validateBeforeSave: false });
+    const attempts = this.security.failedLoginAttempts;
+    let delaySeconds = 0;
+
+    // ✅ FIXED: Match the same logic as the route helper
+    if (attempts === 4) {
+      delaySeconds = 10;
+    } else if (attempts === 8) {
+      delaySeconds = 15;
+    } else if (attempts >= 9) {
+      const additionalDelays = [20, 25, 30, 40, 50, 60];
+      const delayIndex = Math.min(attempts - 9, additionalDelays.length - 1);
+      delaySeconds = additionalDelays[delayIndex];
+    } else {
+      delaySeconds = 0;
+    }
+
+    this.security.delaySeconds = delaySeconds;
+
+    if (delaySeconds > 0) {
+      this.security.nextAllowedLogin = new Date(
+        Date.now() + delaySeconds * 1000
+      );
+      console.log(
+        `⏰ Failed attempt ${attempts}, delay set to ${delaySeconds}s`
+      );
+    } else {
+      this.security.nextAllowedLogin = undefined;
+      console.log(`⚠️ Failed attempt ${attempts}, no delay applied`);
+    }
+
+    await this.save({ validateBeforeSave: false });
+  } catch (error) {
+    console.error("❌ Error handling failed login:", error);
+  }
 };
 
 /**
- * ✅ MODIFIED: Resets security fields and updates activity on successful login.
+ * ✅ FIXED: Resets security fields and updates activity on successful login.
  * @returns {Promise<void>}
  */
 userSchema.methods.handleSuccessfulLogin = async function () {
-  this.lastLogin = new Date();
+  try {
+    console.log("✅ Handling successful login for user:", this.username);
 
-  // ✅ NEW: Update activity for admin/staff users
-  if (this.role === "admin" || this.role === "salon_staff") {
-    this.lastActivity = new Date();
+    this.lastLogin = new Date();
+
+    // ✅ Update activity for admin/staff users
+    if (this.role === "admin" || this.role === "salon_staff") {
+      this.lastActivity = new Date();
+    }
+
+    // Reset security fields
+    if (this.security.failedLoginAttempts > 0) {
+      this.security.failedLoginAttempts = 0;
+      this.security.lastFailedLogin = undefined;
+      this.security.nextAllowedLogin = undefined;
+      this.security.delaySeconds = 0;
+      this.security.accountLocked = false;
+      this.security.lockUntil = undefined;
+    }
+
+    await this.save({ validateBeforeSave: false });
+    console.log("✅ Login security fields reset successfully");
+  } catch (error) {
+    console.error("❌ Error handling successful login:", error);
   }
-
-  if (this.security.failedLoginAttempts > 0) {
-    this.security.failedLoginAttempts = 0;
-    this.security.lastFailedLogin = undefined;
-    this.security.nextAllowedLogin = undefined;
-    this.security.delaySeconds = 0;
-    this.security.accountLocked = false;
-    this.security.lockUntil = undefined;
-  }
-
-  await this.save({ validateBeforeSave: false });
 };
 
 /**
@@ -391,46 +436,64 @@ userSchema.methods.handleSuccessfulLogin = async function () {
  * @returns {Promise<void>}
  */
 userSchema.methods.updateActivity = async function () {
-  if (this.role === "admin" || this.role === "salon_staff") {
-    this.lastActivity = new Date();
-    await this.save({ validateBeforeSave: false });
+  try {
+    if (this.role === "admin" || this.role === "salon_staff") {
+      this.lastActivity = new Date();
+      await this.save({ validateBeforeSave: false });
+    }
+  } catch (error) {
+    console.error("❌ Error updating activity:", error);
   }
 };
 
 /**
- * Checks if the account is locked.
+ * ✅ FIXED: Checks if the account is locked.
  * @returns {boolean} True if account is locked.
  */
 userSchema.methods.isAccountLocked = function () {
-  return (
-    (this.security.accountLocked && this.security.lockUntil > new Date()) ||
-    (this.security.nextAllowedLogin &&
-      this.security.nextAllowedLogin > new Date())
-  );
+  const now = new Date();
+
+  // Check if account is locked until a certain time
+  if (this.security.accountLocked && this.security.lockUntil > now) {
+    return true;
+  }
+
+  // Check if there's an active delay from failed attempts
+  if (this.security.nextAllowedLogin && this.security.nextAllowedLogin > now) {
+    return true;
+  }
+
+  return false;
 };
 
 /**
- * Gets remaining lockout time in seconds.
+ * ✅ FIXED: Gets remaining lockout time in seconds.
  * @returns {number} Remaining seconds.
  */
 userSchema.methods.getRemainingDelayTime = function () {
-  if (!this.security.nextAllowedLogin) return 0;
-  return Math.max(
-    0,
-    Math.ceil((this.security.nextAllowedLogin - new Date()) / 1000)
-  );
+  const now = new Date();
+
+  if (this.security.nextAllowedLogin && this.security.nextAllowedLogin > now) {
+    return Math.ceil((this.security.nextAllowedLogin - now) / 1000);
+  }
+
+  if (this.security.lockUntil && this.security.lockUntil > now) {
+    return Math.ceil((this.security.lockUntil - now) / 1000);
+  }
+
+  return 0;
 };
 
 /**
- * Checks if forgot password should be recommended.
+ * ✅ FIXED: Checks if forgot password should be recommended.
  * @returns {boolean} True if recommended.
  */
 userSchema.methods.shouldRecommendForgotPassword = function () {
-  return this.security.failedLoginAttempts >= 8;
+  return this.security.failedLoginAttempts >= 6;
 };
 
 /**
- * Generates a password reset token.
+ * ✅ FIXED: Generates a password reset token.
  * @returns {string} The reset token.
  */
 userSchema.methods.generatePasswordResetToken = function () {
@@ -439,31 +502,46 @@ userSchema.methods.generatePasswordResetToken = function () {
     .createHash("sha256")
     .update(resetToken)
     .digest("hex");
-  this.security.resetPasswordExpires = Date.now() + 10 * 60 * 1000;
+  this.security.resetPasswordExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
   this.security.lastResetRequest = new Date();
+  this.security.resetPasswordAttempts = 0;
+
+  console.log("🔐 Generated password reset token for user:", this.username);
   return resetToken;
 };
 
 /**
- * Verifies a password reset token.
+ * ✅ FIXED: Verifies a password reset token.
  * @param {string} token - The token to verify.
  * @returns {boolean} True if valid.
  */
 userSchema.methods.verifyPasswordResetToken = function (token) {
-  const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
-  return (
-    this.security.resetPasswordToken === hashedToken &&
-    this.security.resetPasswordExpires > Date.now()
-  );
+  try {
+    if (!token || !this.security.resetPasswordToken) {
+      return false;
+    }
+
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+    const isValid =
+      this.security.resetPasswordToken === hashedToken &&
+      this.security.resetPasswordExpires > Date.now();
+
+    console.log("🔐 Password reset token verification:", isValid);
+    return isValid;
+  } catch (error) {
+    console.error("❌ Error verifying reset token:", error);
+    return false;
+  }
 };
 
 /**
- * Clears password reset token.
+ * ✅ FIXED: Clears password reset token.
  */
 userSchema.methods.clearPasswordResetToken = function () {
   this.security.resetPasswordToken = undefined;
   this.security.resetPasswordExpires = undefined;
   this.security.resetPasswordAttempts = 0;
+  console.log("🔐 Cleared password reset token for user:", this.username);
 };
 
 /**
@@ -505,13 +583,15 @@ userSchema.methods.isGuestUser = function () {
  */
 userSchema.methods.convertGuestToRegular = async function () {
   if (!this.isGuest) throw new Error("User is not a guest");
+
+  console.log("🔄 Converting guest to regular user:", this.username);
   this.isGuest = false;
   this.registrationStep = "completed";
   await this.save();
 };
 
 /**
- * Generates a phone OTP.
+ * ✅ FIXED: Generates a phone OTP.
  * @returns {string} The OTP code.
  */
 userSchema.methods.generatePhoneOTP = function () {
@@ -522,11 +602,13 @@ userSchema.methods.generatePhoneOTP = function () {
     attempts: 0,
     lastSent: new Date(),
   };
+
+  console.log("📱 Generated phone OTP for user:", this.phoneNumber);
   return otp;
 };
 
 /**
- * Generates an email OTP.
+ * ✅ FIXED: Generates an email OTP.
  * @returns {string} The OTP code.
  */
 userSchema.methods.generateEmailOTP = function () {
@@ -537,94 +619,132 @@ userSchema.methods.generateEmailOTP = function () {
     attempts: 0,
     lastSent: new Date(),
   };
+
+  console.log("📧 Generated email OTP for user:", this.email);
   return otp;
 };
 
 /**
- * Verifies a phone OTP.
+ * ✅ FIXED: Verifies a phone OTP.
  * @param {string} otp - The OTP to verify.
  * @returns {Object} Result with success and message.
  */
 userSchema.methods.verifyPhoneOTP = function (otp) {
-  if (!this.verification.phoneOTP || !this.verification.phoneOTP.code) {
+  try {
+    if (!this.verification.phoneOTP || !this.verification.phoneOTP.code) {
+      return {
+        success: false,
+        message: "No OTP found. Please request a new one.",
+      };
+    }
+
+    if (this.verification.phoneOTP.expiresAt < new Date()) {
+      return {
+        success: false,
+        message: "OTP has expired. Please request a new one.",
+      };
+    }
+
+    if (this.verification.phoneOTP.attempts >= 3) {
+      return {
+        success: false,
+        message: "Too many failed attempts. Please request a new OTP.",
+      };
+    }
+
+    if (this.verification.phoneOTP.code !== otp) {
+      this.verification.phoneOTP.attempts += 1;
+      return {
+        success: false,
+        message: "Invalid OTP. Please try again.",
+        remainingAttempts: 3 - this.verification.phoneOTP.attempts,
+      };
+    }
+
+    this.verification.phoneVerified = true;
+    this.verification.phoneOTP = undefined;
+
+    console.log("✅ Phone OTP verified successfully for:", this.phoneNumber);
+    return { success: true, message: "Phone number verified successfully!" };
+  } catch (error) {
+    console.error("❌ Error verifying phone OTP:", error);
     return {
       success: false,
-      message: "No OTP found. Please request a new one.",
+      message: "Error verifying OTP. Please try again.",
     };
   }
-  if (this.verification.phoneOTP.expiresAt < new Date()) {
-    return {
-      success: false,
-      message: "OTP has expired. Please request a new one.",
-    };
-  }
-  if (this.verification.phoneOTP.attempts >= 3) {
-    return {
-      success: false,
-      message: "Too many failed attempts. Please request a new OTP.",
-    };
-  }
-  if (this.verification.phoneOTP.code !== otp) {
-    this.verification.phoneOTP.attempts += 1;
-    return {
-      success: false,
-      message: "Invalid OTP. Please try again.",
-      remainingAttempts: 3 - this.verification.phoneOTP.attempts,
-    };
-  }
-  this.verification.phoneVerified = true;
-  this.verification.phoneOTP = undefined;
-  return { success: true, message: "Phone number verified successfully!" };
 };
 
 /**
- * Verifies an email OTP.
+ * ✅ FIXED: Verifies an email OTP.
  * @param {string} otp - The OTP to verify.
  * @returns {Object} Result with success and message.
  */
 userSchema.methods.verifyEmailOTP = function (otp) {
-  if (!this.verification.emailOTP || !this.verification.emailOTP.code) {
+  try {
+    if (!this.verification.emailOTP || !this.verification.emailOTP.code) {
+      return {
+        success: false,
+        message: "No OTP found. Please request a new one.",
+      };
+    }
+
+    if (this.verification.emailOTP.expiresAt < new Date()) {
+      return {
+        success: false,
+        message: "OTP has expired. Please request a new one.",
+      };
+    }
+
+    if (this.verification.emailOTP.attempts >= 3) {
+      return {
+        success: false,
+        message: "Too many failed attempts. Please request a new OTP.",
+      };
+    }
+
+    if (this.verification.emailOTP.code !== otp) {
+      this.verification.emailOTP.attempts += 1;
+      return {
+        success: false,
+        message: "Invalid OTP. Please try again.",
+        remainingAttempts: 3 - this.verification.emailOTP.attempts,
+      };
+    }
+
+    this.verification.emailVerified = true;
+    this.verification.emailOTP = undefined;
+
+    console.log("✅ Email OTP verified successfully for:", this.email);
+    return { success: true, message: "Email verified successfully!" };
+  } catch (error) {
+    console.error("❌ Error verifying email OTP:", error);
     return {
       success: false,
-      message: "No OTP found. Please request a new one.",
+      message: "Error verifying OTP. Please try again.",
     };
   }
-  if (this.verification.emailOTP.expiresAt < new Date()) {
-    return {
-      success: false,
-      message: "OTP has expired. Please request a new one.",
-    };
-  }
-  if (this.verification.emailOTP.attempts >= 3) {
-    return {
-      success: false,
-      message: "Too many failed attempts. Please request a new OTP.",
-    };
-  }
-  if (this.verification.emailOTP.code !== otp) {
-    this.verification.emailOTP.attempts += 1;
-    return {
-      success: false,
-      message: "Invalid OTP. Please try again.",
-      remainingAttempts: 3 - this.verification.emailOTP.attempts,
-    };
-  }
-  this.verification.emailVerified = true;
-  this.verification.emailOTP = undefined;
-  return { success: true, message: "Email verified successfully!" };
 };
 
 /**
- * Checks if user can request a new OTP.
+ * ✅ FIXED: Checks if user can request a new OTP.
  * @param {string} type - 'phone' or 'email'.
  * @returns {boolean} True if OTP can be requested.
  */
 userSchema.methods.canRequestOTP = function (type = "phone") {
   const otpData =
     type === "phone" ? this.verification.phoneOTP : this.verification.emailOTP;
+
   if (!otpData || !otpData.lastSent) return true;
+
   const timeSinceLastSent = (new Date() - otpData.lastSent) / 1000;
-  return timeSinceLastSent >= 60; // 60 seconds cooldown
+  const canRequest = timeSinceLastSent >= 60; // 60 seconds cooldown
+
+  console.log(`⏰ OTP request check for ${type}:`, {
+    canRequest,
+    timeSinceLastSent,
+  });
+  return canRequest;
 };
 
 /**
@@ -640,7 +760,7 @@ userSchema.statics.validatePasswordStrength = validatePasswordStrength;
  */
 userSchema.statics.getPasswordRequirements = () => ({
   minLength: 8,
-  maxLength: 128, // Updated for plain text passwords
+  maxLength: 128,
   requireUppercase: true,
   requireLowercase: true,
   requireNumber: false,

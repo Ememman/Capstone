@@ -6,8 +6,32 @@ const ServiceSchema = new mongoose.Schema(
     name: { type: String, required: true },
     duration: String,
     priceRange: String,
-    rating: { type: Number, default: 5.0 },
-    totalRaters: { type: Number, default: 0 },
+    rating: {
+      average: {
+        type: Number,
+        default: 0,
+        min: 0,
+        max: 5,
+      },
+      totalRaters: {
+        type: Number,
+        default: 0,
+      },
+      breakdown: {
+        1: { type: Number, default: 0 },
+        2: { type: Number, default: 0 },
+        3: { type: Number, default: 0 },
+        4: { type: Number, default: 0 },
+        5: { type: Number, default: 0 },
+      },
+      percentages: {
+        1: { type: Number, default: 0 },
+        2: { type: Number, default: 0 },
+        3: { type: Number, default: 0 },
+        4: { type: Number, default: 0 },
+        5: { type: Number, default: 0 },
+      },
+    },
     totalBookings: { type: Number, default: 0 },
     category: { type: String, required: true },
     isPromo: { type: Boolean, default: false },
@@ -16,16 +40,176 @@ const ServiceSchema = new mongoose.Schema(
       enum: ["available", "limited", "unavailable"],
       default: "available",
     },
+    description: {
+      type: String,
+      trim: true,
+    },
   },
   {
-    timestamps: true, // This adds createdAt and updatedAt automatically
+    timestamps: true,
   }
 );
 
 ServiceSchema.index({ totalBookings: -1 });
-ServiceSchema.index({ rating: -1 });
+ServiceSchema.index({ "rating.average": -1 });
 ServiceSchema.index({ createdAt: -1 });
 ServiceSchema.index({ category: 1 });
+
+// FIXED: Improved rating update method with better error handling
+ServiceSchema.methods.updateRatingStats = async function () {
+  try {
+    const Rating = mongoose.model("Rating");
+    // FIX: Use getServiceAverageRating instead of getAverageRating
+    // This queries by ratedService field instead of ratedEntity.type
+    const ratingStats = await Rating.getServiceAverageRating(this._id);
+
+    console.log(`📊 Service rating stats calculation:`, {
+      serviceId: this._id,
+      serviceName: this.name,
+      averageRating: ratingStats.averageRating,
+      totalRatings: ratingStats.totalRatings,
+      breakdown: ratingStats.breakdown,
+    });
+
+    // Only update if we have valid rating data
+    if (ratingStats && ratingStats.totalRatings >= 0) {
+      this.rating = {
+        average: ratingStats.averageRating || 0,
+        totalRaters: ratingStats.totalRatings || 0,
+        breakdown: ratingStats.breakdown || { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+      };
+
+      // Calculate percentages for display
+      const total = this.rating.totalRaters;
+      if (total > 0) {
+        this.rating.percentages = {
+          1: Math.round((this.rating.breakdown[1] / total) * 100),
+          2: Math.round((this.rating.breakdown[2] / total) * 100),
+          3: Math.round((this.rating.breakdown[3] / total) * 100),
+          4: Math.round((this.rating.breakdown[4] / total) * 100),
+          5: Math.round((this.rating.breakdown[5] / total) * 100),
+        };
+      } else {
+        this.rating.percentages = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      }
+
+      await this.save({ validateBeforeSave: false });
+      console.log(`✅ Updated rating stats for service: ${this.name}`, {
+        average: this.rating.average,
+        totalRaters: this.rating.totalRaters,
+      });
+    } else {
+      console.log(`⚠️ No rating data found for service: ${this.name}`);
+      // Initialize default rating structure if none exists
+      if (!this.rating) {
+        this.rating = {
+          average: 0,
+          totalRaters: 0,
+          breakdown: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+          percentages: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+        };
+        await this.save({ validateBeforeSave: false });
+      }
+    }
+
+    return this;
+  } catch (error) {
+    console.error("Error updating service rating stats:", error);
+    // Don't throw error to prevent breaking the main flow
+    return this;
+  }
+};
+
+// FIXED: Static method to update rating stats by service ID
+ServiceSchema.statics.updateServiceRating = async function (serviceId) {
+  try {
+    const service = await this.findById(serviceId);
+    if (service) {
+      return await service.updateRatingStats();
+    }
+    return null;
+  } catch (error) {
+    console.error("Error in updateServiceRating:", error);
+    throw error;
+  }
+};
+
+// NEW: Method to add a rating directly
+ServiceSchema.methods.addRating = async function (
+  ratingValue,
+  userId,
+  comment = null,
+  staffId = null
+) {
+  try {
+    const Rating = mongoose.model("Rating");
+
+    // Check if user has already rated this service
+    const existingRating = await Rating.findOne({
+      rater: userId,
+      "ratedEntity.type": "service",
+      "ratedEntity.id": this._id,
+    });
+
+    if (existingRating) {
+      throw new Error("You have already rated this service");
+    }
+
+    // Create new rating
+    const newRating = new Rating({
+      rater: userId,
+      ratedEntity: {
+        type: "service",
+        id: this._id,
+      },
+      ratedService: this._id,
+      ratedStaff: staffId,
+      rating: ratingValue,
+      comment: comment,
+    });
+
+    await newRating.save();
+
+    // Update service rating stats
+    await this.updateRatingStats();
+
+    return newRating;
+  } catch (error) {
+    console.error("Error adding rating to service:", error);
+    throw error;
+  }
+};
+
+// NEW: Pre-save middleware to ensure rating structure
+ServiceSchema.pre("save", function (next) {
+  // Ensure rating structure exists
+  if (!this.rating) {
+    this.rating = {
+      average: 0,
+      totalRaters: 0,
+      breakdown: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+      percentages: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+    };
+  }
+
+  // Ensure percentages are calculated if not present
+  if (this.rating && !this.rating.percentages) {
+    const total = this.rating.totalRaters;
+    if (total > 0) {
+      this.rating.percentages = {
+        1: Math.round((this.rating.breakdown[1] / total) * 100),
+        2: Math.round((this.rating.breakdown[2] / total) * 100),
+        3: Math.round((this.rating.breakdown[3] / total) * 100),
+        4: Math.round((this.rating.breakdown[4] / total) * 100),
+        5: Math.round((this.rating.breakdown[5] / total) * 100),
+      };
+    } else {
+      this.rating.percentages = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+    }
+  }
+
+  next();
+});
 
 // Create the Mongoose model
 const ServiceModel = mongoose.model("Service", ServiceSchema);
@@ -42,18 +226,108 @@ class Service {
     category,
     totalBookings = 0,
     isPromo = false,
-    availability = "available"
+    availability = "available",
+    description = ""
   ) {
     this.id = id;
     this.name = name;
     this.duration = duration;
     this.priceRange = priceRange;
-    this.rating = rating;
-    this.totalRaters = totalRaters;
+
+    // Updated rating structure
+    if (typeof rating === "object") {
+      this.rating = rating;
+    } else {
+      this.rating = {
+        average: rating || 0,
+        totalRaters: totalRaters || 0,
+        breakdown: {
+          1: 0,
+          2: 0,
+          3: 0,
+          4: 0,
+          5: 0,
+        },
+        percentages: {
+          1: 0,
+          2: 0,
+          3: 0,
+          4: 0,
+          5: 0,
+        },
+      };
+      // If we have a numeric rating and totalRaters, distribute breakdown logically
+      if (rating && totalRaters) {
+        this.distributeBreakdown(rating, totalRaters);
+      }
+    }
+
     this.category = category;
     this.totalBookings = totalBookings;
     this.isPromo = isPromo;
     this.availability = availability;
+    this.description = description;
+  }
+
+  // Helper method to distribute ratings logically based on average
+  distributeBreakdown(averageRating, totalRaters) {
+    const avg = averageRating;
+    const total = totalRaters;
+
+    // Simple distribution logic based on average rating
+    if (avg >= 4.5) {
+      this.rating.breakdown = {
+        1: Math.round(total * 0.02),
+        2: Math.round(total * 0.03),
+        3: Math.round(total * 0.1),
+        4: Math.round(total * 0.3),
+        5: Math.round(total * 0.55),
+      };
+    } else if (avg >= 4.0) {
+      this.rating.breakdown = {
+        1: Math.round(total * 0.05),
+        2: Math.round(total * 0.08),
+        3: Math.round(total * 0.15),
+        4: Math.round(total * 0.35),
+        5: Math.round(total * 0.37),
+      };
+    } else if (avg >= 3.5) {
+      this.rating.breakdown = {
+        1: Math.round(total * 0.08),
+        2: Math.round(total * 0.12),
+        3: Math.round(total * 0.25),
+        4: Math.round(total * 0.35),
+        5: Math.round(total * 0.2),
+      };
+    } else {
+      this.rating.breakdown = {
+        1: Math.round(total * 0.15),
+        2: Math.round(total * 0.2),
+        3: Math.round(total * 0.3),
+        4: Math.round(total * 0.25),
+        5: Math.round(total * 0.1),
+      };
+    }
+
+    // Ensure total matches
+    const currentTotal = Object.values(this.rating.breakdown).reduce(
+      (a, b) => a + b,
+      0
+    );
+    if (currentTotal !== total) {
+      this.rating.breakdown[5] += total - currentTotal;
+    }
+
+    // Calculate percentages
+    if (total > 0) {
+      this.rating.percentages = {
+        1: Math.round((this.rating.breakdown[1] / total) * 100),
+        2: Math.round((this.rating.breakdown[2] / total) * 100),
+        3: Math.round((this.rating.breakdown[3] / total) * 100),
+        4: Math.round((this.rating.breakdown[4] / total) * 100),
+        5: Math.round((this.rating.breakdown[5] / total) * 100),
+      };
+    }
   }
 
   // Static method to get all services
@@ -65,7 +339,7 @@ class Service {
         "TRIM",
         "30min",
         "₱150",
-        5.0,
+        4.8,
         289,
         "Haircuts & Basic Services",
         289
@@ -75,7 +349,7 @@ class Service {
         "HAIRCUT",
         "45min",
         "₱350",
-        5.0,
+        4.9,
         345,
         "Haircuts & Basic Services",
         345,
@@ -86,7 +360,7 @@ class Service {
         "HAIRCUT(TRIM)",
         "30min",
         "₱200",
-        5.0,
+        4.7,
         267,
         "Haircuts & Basic Services",
         267
@@ -96,7 +370,7 @@ class Service {
         "HAIRCUT W/ SHAM/CONDI AND BLOW",
         "1hr",
         "₱450",
-        5.0,
+        4.6,
         234,
         "Haircuts & Basic Services",
         234
@@ -106,7 +380,7 @@ class Service {
         "HAIRCUT W/ HAIRGOAL SHAM/ CONDI AND BLOW DRY",
         "1hr",
         "₱500",
-        5.0,
+        4.8,
         198,
         "Haircuts & Basic Services",
         198
@@ -116,7 +390,7 @@ class Service {
         "SHAMPOO",
         "30min",
         "₱150",
-        5.0,
+        4.5,
         456,
         "Haircuts & Basic Services",
         456,
@@ -127,7 +401,7 @@ class Service {
         "BLOW DRY",
         "45min",
         "₱250",
-        5.0,
+        4.7,
         378,
         "Haircuts & Basic Services",
         378
@@ -137,7 +411,7 @@ class Service {
         "HAIR STYLE",
         "1hr",
         "₱350",
-        5.0,
+        4.4,
         189,
         "Haircuts & Basic Services",
         189
@@ -147,7 +421,7 @@ class Service {
         "HAIR CURL SET",
         "1hr",
         "₱400",
-        5.0,
+        4.6,
         234,
         "Haircuts & Basic Services",
         234
@@ -157,7 +431,7 @@ class Service {
         "HAIR IRON",
         "45min",
         "₱300",
-        5.0,
+        4.3,
         167,
         "Haircuts & Basic Services",
         167
@@ -167,7 +441,7 @@ class Service {
         "SHAVING(EYEBROWS)",
         "30min",
         "₱100",
-        5.0,
+        4.9,
         289,
         "Haircuts & Basic Services",
         289
@@ -179,7 +453,7 @@ class Service {
         "BASIC COLOR",
         "2hr",
         "₱1,000",
-        5.0,
+        4.7,
         345,
         "Hair Coloring",
         345,
@@ -190,7 +464,7 @@ class Service {
         "FASHION COLOR",
         "2.5hr",
         "₱1,500",
-        5.0,
+        4.8,
         267,
         "Hair Coloring",
         267
@@ -200,7 +474,7 @@ class Service {
         "BLEACH ONLY",
         "2hr",
         "₱1,000",
-        5.0,
+        4.5,
         234,
         "Hair Coloring",
         234
@@ -210,7 +484,7 @@ class Service {
         "HIGHLIGHTS ONLY",
         "2hr",
         "₱1,500",
-        5.0,
+        4.6,
         198,
         "Hair Coloring",
         198
@@ -220,7 +494,7 @@ class Service {
         "BASIC HIGHLIGHTS ONLY",
         "2hr",
         "₱1,999",
-        5.0,
+        4.4,
         167,
         "Hair Coloring",
         167
@@ -230,7 +504,7 @@ class Service {
         "COLOR HIGHLIGHTS",
         "2.5hr",
         "₱1,200",
-        5.0,
+        4.7,
         189,
         "Hair Coloring",
         189
@@ -240,7 +514,7 @@ class Service {
         "BALAYAGE",
         "3hr",
         "₱2,000",
-        5.0,
+        4.9,
         145,
         "Hair Coloring",
         145
@@ -250,7 +524,7 @@ class Service {
         "PEEK A BOO",
         "2hr",
         "₱1,500",
-        5.0,
+        4.8,
         123,
         "Hair Coloring",
         123
@@ -262,7 +536,7 @@ class Service {
         "PERM ANY LENGTH",
         "2hr",
         "₱1,888",
-        5.0,
+        4.6,
         234,
         "Perming & Texture Services",
         234
@@ -272,7 +546,7 @@ class Service {
         "PERM + TREATMENT ANY LENGTH",
         "2.5hr",
         "₱2,288",
-        5.0,
+        4.7,
         198,
         "Perming & Texture Services",
         198
@@ -282,7 +556,7 @@ class Service {
         "PERM + HAIRCOLOR ANY LENGTH",
         "3hr",
         "₱2,488",
-        5.0,
+        4.5,
         178,
         "Perming & Texture Services",
         178
@@ -292,7 +566,7 @@ class Service {
         "AIR PERMING",
         "2hr",
         "₱1,588",
-        5.0,
+        4.8,
         145,
         "Perming & Texture Services",
         145
@@ -302,7 +576,7 @@ class Service {
         "BASIC COLOR + AIR PERM",
         "3hr",
         "₱2,188",
-        5.0,
+        4.6,
         167,
         "Perming & Texture Services",
         167
@@ -314,7 +588,7 @@ class Service {
         "REBOND ONLY",
         "3hr",
         "₱3,000",
-        5.0,
+        4.8,
         234,
         "Rebonding/Straightening",
         234,
@@ -325,7 +599,7 @@ class Service {
         "REBOND + HAIRCUT",
         "3.5hr",
         "₱3,299",
-        5.0,
+        4.7,
         189,
         "Rebonding/Straightening",
         189
@@ -335,7 +609,7 @@ class Service {
         "REBOND + HAIR MASK",
         "3.5hr",
         "₱3,300",
-        5.0,
+        4.9,
         178,
         "Rebonding/Straightening",
         178
@@ -345,7 +619,7 @@ class Service {
         "REBOND + HOTOIL",
         "3.5hr",
         "₱3,399",
-        5.0,
+        4.6,
         167,
         "Rebonding/Straightening",
         167
@@ -355,7 +629,7 @@ class Service {
         "REBOND + BASIC COLOR",
         "4hr",
         "₱3,288",
-        5.0,
+        4.5,
         145,
         "Rebonding/Straightening",
         145
@@ -365,7 +639,7 @@ class Service {
         "REBOND + HAIR MASK + HAIR CUT",
         "4hr",
         "₱3,599",
-        5.0,
+        4.7,
         156,
         "Rebonding/Straightening",
         156
@@ -377,7 +651,7 @@ class Service {
         "HOT OIL",
         "1hr",
         "₱300",
-        5.0,
+        4.6,
         127,
         "Hair Treatments",
         127
@@ -387,7 +661,7 @@ class Service {
         "HAIR SPA",
         "1.5hr",
         "₱350",
-        5.0,
+        4.7,
         156,
         "Hair Treatments",
         156
@@ -397,7 +671,7 @@ class Service {
         "HAIR MASK",
         "1hr",
         "₱300",
-        5.0,
+        4.5,
         203,
         "Hair Treatments",
         203
@@ -407,7 +681,7 @@ class Service {
         "U COLAGENT",
         "1.5hr",
         "₱400",
-        5.0,
+        4.4,
         89,
         "Hair Treatments",
         89
@@ -417,7 +691,7 @@ class Service {
         "U-COLLAGENT TREATMENT",
         "2hr",
         "₱500",
-        5.0,
+        4.3,
         78,
         "Hair Treatments",
         78
@@ -427,7 +701,7 @@ class Service {
         "CYSTEINE TREATMENT",
         "3hr",
         "₱3,500",
-        5.0,
+        4.8,
         78,
         "Hair Treatments",
         78
@@ -437,7 +711,7 @@ class Service {
         "CYSTEINE",
         "3hr",
         "₱3,500",
-        5.0,
+        4.7,
         92,
         "Hair Treatments",
         92
@@ -447,7 +721,7 @@ class Service {
         "HAIR BOTOX",
         "2hr",
         "₱2,000",
-        5.0,
+        4.9,
         134,
         "Hair Treatments",
         134,
@@ -458,7 +732,7 @@ class Service {
         "XBOOTER",
         "2hr",
         "₱1,800",
-        5.0,
+        4.2,
         67,
         "Hair Treatments",
         67
@@ -468,7 +742,7 @@ class Service {
         "KERADOSE",
         "2.5hr",
         "₱2,500",
-        5.0,
+        4.6,
         89,
         "Hair Treatments",
         89
@@ -478,7 +752,7 @@ class Service {
         "KERABOND TREATMENT",
         "2.5hr",
         "₱2,800",
-        5.0,
+        4.5,
         76,
         "Hair Treatments",
         76
@@ -488,7 +762,7 @@ class Service {
         "BRAZILLIAN BLOWOUT",
         "3hr",
         "₱3,500",
-        5.0,
+        4.8,
         156,
         "Hair Treatments",
         156
@@ -498,7 +772,7 @@ class Service {
         "KERATIN BLOWOUT TREATMENT",
         "3hr",
         "₱3,200",
-        5.0,
+        4.7,
         145,
         "Hair Treatments",
         145
@@ -508,7 +782,7 @@ class Service {
         "SPLEX #1 BOND CREATOR",
         "2hr",
         "₱2,500",
-        5.0,
+        4.4,
         45,
         "Hair Treatments",
         45
@@ -518,7 +792,7 @@ class Service {
         "COLORPLEX 1",
         "2hr",
         "₱2,500",
-        5.0,
+        4.3,
         54,
         "Hair Treatments",
         54
@@ -528,7 +802,7 @@ class Service {
         "OLAPLEX #1",
         "2hr",
         "₱2,500",
-        5.0,
+        4.4,
         45,
         "Hair Treatments",
         45
@@ -540,7 +814,7 @@ class Service {
         "REBOND + CYSTEINE",
         "4hr",
         "₱4,500",
-        5.0,
+        4.7,
         123,
         "Combination Services",
         123
@@ -550,7 +824,7 @@ class Service {
         "REBOND + U COLAGENT",
         "4hr",
         "₱4,000",
-        5.0,
+        4.6,
         98,
         "Combination Services",
         98
@@ -560,7 +834,7 @@ class Service {
         "REBOND + HAIR BOTOX",
         "4hr",
         "₱4,200",
-        5.0,
+        4.8,
         112,
         "Combination Services",
         112
@@ -570,7 +844,7 @@ class Service {
         "REBOND + KERADOSE",
         "4.5hr",
         "₱4,800",
-        5.0,
+        4.5,
         87,
         "Combination Services",
         87
@@ -580,7 +854,7 @@ class Service {
         "REBOND + BOTOX",
         "4hr",
         "₱4,200",
-        5.0,
+        4.7,
         95,
         "Combination Services",
         95
@@ -590,7 +864,7 @@ class Service {
         "REBOND + BRAZILLIAN BLOWOUT",
         "5hr",
         "₱5,500",
-        5.0,
+        4.9,
         78,
         "Combination Services",
         78
@@ -600,7 +874,7 @@ class Service {
         "REBOND + KERATIN",
         "4.5hr",
         "₱5,000",
-        5.0,
+        4.8,
         134,
         "Combination Services",
         134
@@ -610,7 +884,7 @@ class Service {
         "REBOND + HAIRSPA",
         "4hr",
         "₱3,500",
-        5.0,
+        4.6,
         145,
         "Combination Services",
         145
@@ -620,7 +894,7 @@ class Service {
         "REBOND + HOT OIL",
         "3.5hr",
         "₱3,399",
-        5.0,
+        4.5,
         167,
         "Combination Services",
         167
@@ -630,7 +904,7 @@ class Service {
         "REBOND + KERATIN BLOWOUT",
         "4.5hr",
         "₱4,800",
-        5.0,
+        4.7,
         123,
         "Combination Services",
         123
@@ -640,7 +914,7 @@ class Service {
         "BASIC COLOR + HAIR SPA",
         "2.5hr",
         "₱1,350",
-        5.0,
+        4.6,
         189,
         "Combination Services",
         189
@@ -650,7 +924,7 @@ class Service {
         "BASIC COLOR + HOT OIL",
         "2.5hr",
         "₱1,300",
-        5.0,
+        4.5,
         198,
         "Combination Services",
         198
@@ -660,7 +934,7 @@ class Service {
         "BASIC COLOR + HAIR MASK",
         "2.5hr",
         "₱1,300",
-        5.0,
+        4.4,
         176,
         "Combination Services",
         176
@@ -670,7 +944,7 @@ class Service {
         "BASIC COLOR + BOTOX",
         "3hr",
         "₱2,500",
-        5.0,
+        4.7,
         145,
         "Combination Services",
         145
@@ -680,7 +954,7 @@ class Service {
         "BASIC COLOR + KERADOSE",
         "3.5hr",
         "₱3,000",
-        5.0,
+        4.6,
         134,
         "Combination Services",
         134
@@ -690,7 +964,7 @@ class Service {
         "BASIC COLOR + KERABOND",
         "3.5hr",
         "₱3,200",
-        5.0,
+        4.5,
         123,
         "Combination Services",
         123
@@ -700,7 +974,7 @@ class Service {
         "BASIC COLOR + BRAZILLIAN",
         "4hr",
         "₱3,800",
-        5.0,
+        4.8,
         112,
         "Combination Services",
         112
@@ -710,7 +984,7 @@ class Service {
         "BASIC COLOR + KERATIN",
         "4hr",
         "₱3,500",
-        5.0,
+        4.7,
         128,
         "Combination Services",
         128
@@ -720,7 +994,7 @@ class Service {
         "BASIC COLOR + U-COLLAGENT",
         "3hr",
         "₱1,500",
-        5.0,
+        4.4,
         109,
         "Combination Services",
         109
@@ -730,7 +1004,7 @@ class Service {
         "BASIC COLOR + CYSTEINE",
         "4hr",
         "₱4,000",
-        5.0,
+        4.6,
         98,
         "Combination Services",
         98
@@ -740,7 +1014,7 @@ class Service {
         "HAIR COLOR + HAIR MASK",
         "3hr",
         "₱1,800",
-        5.0,
+        4.5,
         167,
         "Combination Services",
         167
@@ -750,7 +1024,7 @@ class Service {
         "HAIR COLOR + HAIRCUT",
         "2.5hr",
         "₱1,500",
-        5.0,
+        4.7,
         189,
         "Combination Services",
         189
@@ -760,7 +1034,7 @@ class Service {
         "HAIR COLOR + HAIR BOTOX",
         "3.5hr",
         "₱2,800",
-        5.0,
+        4.8,
         145,
         "Combination Services",
         145
@@ -770,7 +1044,7 @@ class Service {
         "HAIR COLOR + KERATIN BLOW OUT",
         "4hr",
         "₱2,999",
-        5.0,
+        4.6,
         89,
         "Combination Services",
         89
@@ -780,7 +1054,7 @@ class Service {
         "COLOR HIGHLIGHTS + KERABOND",
         "4hr",
         "₱3,500",
-        5.0,
+        4.5,
         87,
         "Combination Services",
         87
@@ -790,7 +1064,7 @@ class Service {
         "COLOR HIGHLIGHTS + BRAZILLIAN",
         "4.5hr",
         "₱4,000",
-        5.0,
+        4.7,
         76,
         "Combination Services",
         76
@@ -800,7 +1074,7 @@ class Service {
         "COLOR HIGHLIGHTS + KERATIN",
         "4hr",
         "₱3,800",
-        5.0,
+        4.6,
         82,
         "Combination Services",
         82
@@ -810,7 +1084,7 @@ class Service {
         "BALAYAGE + KERABOND",
         "4.5hr",
         "₱4,200",
-        5.0,
+        4.8,
         67,
         "Combination Services",
         67
@@ -820,7 +1094,7 @@ class Service {
         "BALAYAGE + BRAZILLIAN",
         "5hr",
         "₱4,800",
-        5.0,
+        4.9,
         54,
         "Combination Services",
         54
@@ -830,7 +1104,7 @@ class Service {
         "BALAYAGE + KERATIN",
         "4.5hr",
         "₱4,500",
-        5.0,
+        4.7,
         61,
         "Combination Services",
         61
@@ -840,7 +1114,7 @@ class Service {
         "PEEK A BOO + BRAZILLIAN",
         "4hr",
         "₱4,200",
-        5.0,
+        4.6,
         58,
         "Combination Services",
         58
@@ -850,7 +1124,7 @@ class Service {
         "PEEK A BOO + KERATIN",
         "4hr",
         "₱3,800",
-        5.0,
+        4.5,
         63,
         "Combination Services",
         63
@@ -860,7 +1134,7 @@ class Service {
         "FASHION COLOR(FULL BLEACH) + BRAZILLIAN",
         "5hr",
         "₱4,500",
-        5.0,
+        4.7,
         45,
         "Combination Services",
         45
@@ -870,7 +1144,7 @@ class Service {
         "FASHION COLOR(FULL BLEACH) + KERATIN",
         "5hr",
         "₱4,200",
-        5.0,
+        4.6,
         48,
         "Combination Services",
         48
@@ -880,7 +1154,7 @@ class Service {
         "REBOND + BASIC COLOR + HAIR MASK",
         "5hr",
         "₱4,200",
-        5.0,
+        4.5,
         112,
         "Combination Services",
         112
@@ -890,7 +1164,7 @@ class Service {
         "REBOND + BASIC COLOR + BRAZILLIAN",
         "6hr",
         "₱5,800",
-        5.0,
+        4.8,
         78,
         "Combination Services",
         78
@@ -900,7 +1174,7 @@ class Service {
         "REBOND + BASIC COLOR + KERATIN",
         "5.5hr",
         "₱5,399",
-        5.0,
+        4.7,
         89,
         "Combination Services",
         89
@@ -910,7 +1184,7 @@ class Service {
         "REBOND + BASIC COLOR + U-COLLAGENT",
         "5hr",
         "₱4,500",
-        5.0,
+        4.6,
         76,
         "Combination Services",
         76
@@ -920,7 +1194,7 @@ class Service {
         "REBOND + BASIC COLOR + CYSTEINE",
         "6hr",
         "₱6,000",
-        5.0,
+        4.9,
         67,
         "Combination Services",
         67
@@ -930,7 +1204,7 @@ class Service {
         "REBOND + BASIC COLOR + KERADOSE",
         "5.5hr",
         "₱5,500",
-        5.0,
+        4.7,
         71,
         "Combination Services",
         71
@@ -940,7 +1214,7 @@ class Service {
         "REBOND + HAIR COLOR + HAIR BOTOX",
         "5hr",
         "₱4,800",
-        5.0,
+        4.8,
         82,
         "Combination Services",
         82
@@ -950,7 +1224,7 @@ class Service {
         "REBOND + HAIR COLOR + HAIR MASK + HAIRCUT",
         "5hr",
         "₱3,999",
-        5.0,
+        4.6,
         78,
         "Combination Services",
         78
@@ -960,7 +1234,7 @@ class Service {
         "REBOND + HAIR COLOR + HIGHLIGHTS + HAIRCUT + HOTOIL",
         "6hr",
         "₱5,999",
-        5.0,
+        4.7,
         56,
         "Combination Services",
         56
@@ -970,7 +1244,7 @@ class Service {
         "REBOND + HAIR COLOR + HAIR BOTOX + HAIR CUT",
         "5hr",
         "₱4,599",
-        5.0,
+        4.5,
         67,
         "Combination Services",
         67
@@ -980,7 +1254,7 @@ class Service {
         "REBOND + KERADOSE + HAIRCUT",
         "4.5hr",
         "₱4,999",
-        5.0,
+        4.6,
         73,
         "Combination Services",
         73
@@ -990,7 +1264,7 @@ class Service {
         "REBOND + KERADOSE + HAIRCOLOR + HAIRCUT",
         "5.5hr",
         "₱5,399",
-        5.0,
+        4.7,
         45,
         "Combination Services",
         45
@@ -1000,7 +1274,7 @@ class Service {
         "CYSTEINE + U COLAGENT",
         "4hr",
         "₱4,000",
-        5.0,
+        4.5,
         54,
         "Combination Services",
         54
@@ -1010,7 +1284,7 @@ class Service {
         "HAIR BOTOX + HAIRCUT",
         "3hr",
         "₱2,499",
-        5.0,
+        4.8,
         156,
         "Combination Services",
         156
@@ -1020,7 +1294,7 @@ class Service {
         "HOTOIL + HAIRCUT",
         "1.5hr",
         "₱450",
-        5.0,
+        4.6,
         187,
         "Combination Services",
         187
@@ -1030,7 +1304,7 @@ class Service {
         "HAIRSPA + HAIRCUT",
         "2hr",
         "₱550",
-        5.0,
+        4.7,
         165,
         "Combination Services",
         165
@@ -1040,7 +1314,7 @@ class Service {
         "KERADOSE TREATMENT + HAIRCUT",
         "3hr",
         "₱2,699",
-        5.0,
+        4.5,
         98,
         "Combination Services",
         98
@@ -1050,7 +1324,7 @@ class Service {
         "KERADOSE TREATMENT + HAIRCOLOR + HAIRCUT",
         "4hr",
         "₱3,699",
-        5.0,
+        4.6,
         78,
         "Combination Services",
         78
@@ -1062,7 +1336,7 @@ class Service {
         "HAIR EXTENSION ONLY(STARTING)",
         "2hr",
         "₱10,000",
-        5.0,
+        4.8,
         45,
         "Hair Extensions",
         45
@@ -1072,7 +1346,7 @@ class Service {
         "HAIR EXTENSION REMOVAL",
         "1hr",
         "₱3,000",
-        5.0,
+        4.7,
         67,
         "Hair Extensions",
         67
@@ -1084,7 +1358,7 @@ class Service {
         "HAIR AND MAKE UP",
         "1.5hr",
         "₱1,500",
-        5.0,
+        4.9,
         123,
         "Styling & Special Services",
         123
@@ -1094,7 +1368,7 @@ class Service {
         "VIP",
         "2hr",
         "₱2,500",
-        5.0,
+        4.8,
         67,
         "Styling & Special Services",
         67
@@ -1104,7 +1378,7 @@ class Service {
         "MC",
         "1hr",
         "₱1,500",
-        5.0,
+        4.7,
         89,
         "Styling & Special Services",
         89
@@ -1114,7 +1388,7 @@ class Service {
         "DIAMOND",
         "3hr",
         "₱8,000",
-        5.0,
+        4.9,
         34,
         "Styling & Special Services",
         34
@@ -1126,7 +1400,7 @@ class Service {
         "THM",
         "2hr",
         "₱1,800",
-        5.0,
+        4.6,
         234,
         "Package Sets/Codes",
         234
@@ -1136,7 +1410,7 @@ class Service {
         "TSF SET",
         "2.5hr",
         "₱2,200",
-        5.0,
+        4.7,
         189,
         "Package Sets/Codes",
         189
@@ -1146,7 +1420,7 @@ class Service {
         "TKM",
         "2hr",
         "₱1,900",
-        5.0,
+        4.5,
         167,
         "Package Sets/Codes",
         167
@@ -1156,7 +1430,7 @@ class Service {
         "MH SET",
         "1.5hr",
         "₱1,500",
-        5.0,
+        4.8,
         156,
         "Package Sets/Codes",
         156
@@ -1166,7 +1440,7 @@ class Service {
         "LHS",
         "2hr",
         "₱1,700",
-        5.0,
+        4.6,
         145,
         "Package Sets/Codes",
         145
@@ -1176,7 +1450,7 @@ class Service {
         "EWS",
         "2.5hr",
         "₱2,000",
-        5.0,
+        4.7,
         134,
         "Package Sets/Codes",
         134
@@ -1186,7 +1460,7 @@ class Service {
         "FMS",
         "3hr",
         "₱2,500",
-        5.0,
+        4.5,
         123,
         "Package Sets/Codes",
         123
@@ -1196,7 +1470,7 @@ class Service {
         "KV SET",
         "2hr",
         "₱1,800",
-        5.0,
+        4.6,
         112,
         "Package Sets/Codes",
         112
@@ -1206,7 +1480,7 @@ class Service {
         "LHMB",
         "2.5hr",
         "₱2,100",
-        5.0,
+        4.7,
         98,
         "Package Sets/Codes",
         98
@@ -1216,7 +1490,7 @@ class Service {
         "REV",
         "2hr",
         "₱1,900",
-        5.0,
+        4.5,
         87,
         "Package Sets/Codes",
         87
@@ -1226,7 +1500,7 @@ class Service {
         "KS",
         "2hr",
         "₱1,800",
-        5.0,
+        4.6,
         76,
         "Package Sets/Codes",
         76
@@ -1236,7 +1510,7 @@ class Service {
         "D.O",
         "1.5hr",
         "₱1,400",
-        5.0,
+        4.7,
         89,
         "Package Sets/Codes",
         89
@@ -1246,7 +1520,7 @@ class Service {
         "NHRM",
         "2hr",
         "₱1,750",
-        5.0,
+        4.4,
         67,
         "Package Sets/Codes",
         67
@@ -1256,7 +1530,7 @@ class Service {
         "M.O",
         "2hr",
         "₱1,850",
-        5.0,
+        4.5,
         54,
         "Package Sets/Codes",
         54
@@ -1266,7 +1540,7 @@ class Service {
         "SLBP SET",
         "3hr",
         "₱2,600",
-        5.0,
+        4.7,
         61,
         "Package Sets/Codes",
         61
@@ -1276,7 +1550,7 @@ class Service {
         "SLBPS",
         "3hr",
         "₱2,650",
-        5.0,
+        4.6,
         58,
         "Package Sets/Codes",
         58
@@ -1286,7 +1560,7 @@ class Service {
         "EK SET",
         "2.5hr",
         "₱2,300",
-        5.0,
+        4.8,
         73,
         "Package Sets/Codes",
         73
@@ -1296,7 +1570,7 @@ class Service {
         "A.O",
         "1.5hr",
         "₱1,300",
-        5.0,
+        4.5,
         82,
         "Package Sets/Codes",
         82
@@ -1306,7 +1580,7 @@ class Service {
         "DETOX",
         "2hr",
         "₱1,600",
-        5.0,
+        4.6,
         94,
         "Package Sets/Codes",
         94
@@ -1316,7 +1590,7 @@ class Service {
         "GLAM",
         "2.5hr",
         "₱2,400",
-        5.0,
+        4.7,
         71,
         "Package Sets/Codes",
         71
@@ -1326,7 +1600,7 @@ class Service {
         "BKHM",
         "2hr",
         "₱1,950",
-        5.0,
+        4.5,
         63,
         "Package Sets/Codes",
         63
@@ -1336,7 +1610,7 @@ class Service {
         "ES SET",
         "2hr",
         "₱1,800",
-        5.0,
+        4.6,
         78,
         "Package Sets/Codes",
         78
@@ -1346,7 +1620,7 @@ class Service {
         "G AND G SET",
         "3hr",
         "₱2,800",
-        5.0,
+        4.8,
         45,
         "Package Sets/Codes",
         45
@@ -1369,6 +1643,21 @@ class Service {
   static getAllCategories() {
     const services = this.getAllServices();
     return [...new Set(services.map((service) => service.category))];
+  }
+
+  // Helper method to convert service instance to MongoDB document format
+  toMongoDocument() {
+    return {
+      name: this.name,
+      duration: this.duration,
+      priceRange: this.priceRange,
+      rating: this.rating,
+      totalBookings: this.totalBookings,
+      category: this.category,
+      isPromo: this.isPromo,
+      availability: this.availability,
+      description: this.description,
+    };
   }
 }
 

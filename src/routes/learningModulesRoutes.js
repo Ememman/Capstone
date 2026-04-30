@@ -1,6 +1,8 @@
+// routes/learningModulesRoutes.js - Updated with Complete Quiz System
 import express from "express";
 import { LearningModule, UserProgress } from "../models/LearningModules.js";
 import { authMiddleware } from "../middleware/auth.js";
+import { authenticateAdmin, staffOnly } from "../middleware/adminAuth.js";
 
 const router = express.Router();
 
@@ -16,6 +18,7 @@ router.get("/", authMiddleware, async (req, res) => {
       page = 1,
       limit = 12,
       minRating,
+      hasQuiz,
     } = req.query;
 
     const query = { isActive: true };
@@ -27,6 +30,8 @@ router.get("/", authMiddleware, async (req, res) => {
     if (minRating)
       query["rating.average"] = { $gte: Number.parseFloat(minRating) };
     if (featured === "true") query.isFeatured = true;
+    if (hasQuiz === "true") query["quiz.isEnabled"] = true;
+    if (hasQuiz === "false") query["quiz.isEnabled"] = false;
 
     // Handle search
     if (search) {
@@ -69,9 +74,19 @@ router.get("/", authMiddleware, async (req, res) => {
                 progress: progress.progress,
                 bookmarked: progress.bookmarked,
                 lastAccessedAt: progress.lastAccessedAt,
+                quizStats: progress.getQuizStats
+                  ? progress.getQuizStats()
+                  : null,
               }
             : null,
-          completionRate: module.getCompletionRate(),
+          completionRate:
+            module.enrollment.totalEnrolled > 0
+              ? Math.round(
+                  (module.enrollment.completed /
+                    module.enrollment.totalEnrolled) *
+                    100
+                )
+              : 0,
         };
       })
     );
@@ -97,7 +112,13 @@ router.get("/", authMiddleware, async (req, res) => {
 // Get featured modules
 router.get("/featured", authMiddleware, async (req, res) => {
   try {
-    const modules = await LearningModule.getFeaturedModules();
+    const modules = await LearningModule.find({
+      isActive: true,
+      isFeatured: true,
+    })
+      .limit(6)
+      .populate("createdBy", "username profileImage")
+      .sort({ "rating.average": -1 });
 
     const modulesWithProgress = await Promise.all(
       modules.map(async (module) => {
@@ -109,7 +130,14 @@ router.get("/featured", authMiddleware, async (req, res) => {
         return {
           ...module.toObject(),
           userProgress: progress,
-          completionRate: module.getCompletionRate(),
+          completionRate:
+            module.enrollment.totalEnrolled > 0
+              ? Math.round(
+                  (module.enrollment.completed /
+                    module.enrollment.totalEnrolled) *
+                    100
+                )
+              : 0,
         };
       })
     );
@@ -152,7 +180,14 @@ router.get("/:id", authMiddleware, async (req, res) => {
       data: {
         ...module.toObject(),
         userProgress: progress,
-        completionRate: module.getCompletionRate(),
+        completionRate:
+          module.enrollment.totalEnrolled > 0
+            ? Math.round(
+                (module.enrollment.completed /
+                  module.enrollment.totalEnrolled) *
+                  100
+              )
+            : 0,
       },
     });
   } catch (error) {
@@ -199,7 +234,11 @@ router.post("/:id/enroll", authMiddleware, async (req, res) => {
     res.json({
       success: true,
       message: "Successfully enrolled in module",
-      data: progress,
+      data: {
+        progress,
+        hasQuiz: module.quiz?.isEnabled || false,
+        quizEnabled: module.quiz?.isEnabled || false,
+      },
     });
   } catch (error) {
     res.status(500).json({
@@ -245,6 +284,9 @@ router.put("/:id/progress", authMiddleware, async (req, res) => {
 
     // If completed, update module completion count
     if (progress.progress === 100 && progress.status !== "completed") {
+      progress.status = "completed";
+      progress.completedAt = new Date();
+
       const module = await LearningModule.findById(moduleId);
       if (module) {
         module.enrollment.completed += 1;
@@ -268,7 +310,345 @@ router.put("/:id/progress", authMiddleware, async (req, res) => {
   }
 });
 
-// Submit quiz
+// ==================== QUIZ SYSTEM ROUTES ====================
+
+// GET /api/training/:id/progress - Get user progress for a module
+router.get("/:id/progress", authMiddleware, async (req, res) => {
+  try {
+    const moduleId = req.params.id;
+    const userId = req.user.id;
+
+    const progress = await UserProgress.findOne({ userId, moduleId });
+    const module = await LearningModule.findById(moduleId);
+
+    if (!module) {
+      return res.status(404).json({
+        success: false,
+        message: "Module not found",
+      });
+    }
+
+    // Check if user can take quiz
+    const canTakeQuiz = () => {
+      if (!module.quiz?.isEnabled) return false;
+
+      if (
+        module.quiz.maxAttempts > 0 &&
+        progress?.quizAttempts?.length >= module.quiz.maxAttempts
+      ) {
+        return false;
+      }
+
+      return module.quiz.allowRetakes || !progress?.quizCompleted;
+    };
+
+    res.json({
+      success: true,
+      data: {
+        progress: progress || {
+          userId,
+          moduleId,
+          status: "not-started",
+          progress: 0,
+          quizAttempts: [],
+          currentAttempt: 0,
+          bestScore: 0,
+          quizCompleted: false,
+        },
+        canTakeQuiz: canTakeQuiz(),
+        moduleQuizEnabled: module.quiz?.isEnabled || false,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching user progress",
+      error: error.message,
+    });
+  }
+});
+
+// POST /api/training/:id/quiz/attempt - Submit quiz attempt
+router.post("/:id/quiz/attempt", authMiddleware, async (req, res) => {
+  try {
+    const moduleId = req.params.id;
+    const userId = req.user.id;
+    const attemptData = req.body;
+
+    const module = await LearningModule.findById(moduleId);
+    if (!module || !module.quiz?.isEnabled) {
+      return res.status(404).json({
+        success: false,
+        message: "Module or quiz not found",
+      });
+    }
+
+    // Find or create user progress
+    let progress = await UserProgress.findOne({ userId, moduleId });
+    if (!progress) {
+      progress = new UserProgress({
+        userId,
+        moduleId,
+        status: "in-progress",
+      });
+    }
+
+    // Check daily attempts
+    const today = new Date().toDateString();
+    const todaysAttempts = progress.quizAttempts.filter(
+      (attempt) => new Date(attempt.completedAt).toDateString() === today
+    );
+
+    const maxAttempts = module.quiz.maxAttempts || 3;
+    if (todaysAttempts.length >= maxAttempts && !attemptData.passed) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum ${maxAttempts} attempts per day reached. Try again tomorrow.`,
+      });
+    }
+
+    // Check if user already passed
+    if (progress.quizCompleted) {
+      return res.status(400).json({
+        success: false,
+        message: "You have already passed this quiz",
+      });
+    }
+
+    // Add quiz attempt
+    const attemptNumber = progress.quizAttempts.length + 1;
+    const newAttempt = {
+      attemptNumber,
+      score: attemptData.score,
+      correctAnswers: attemptData.correctAnswers,
+      totalQuestions: attemptData.totalQuestions,
+      timeSpent: attemptData.timeSpent,
+      answers: attemptData.answers,
+      passed: attemptData.passed,
+      completedAt: new Date(),
+    };
+
+    progress.quizAttempts.push(newAttempt);
+    progress.currentAttempt = attemptNumber;
+    progress.lastQuizAttempt = new Date();
+
+    // Update best score
+    if (attemptData.score > progress.bestScore) {
+      progress.bestScore = attemptData.score;
+    }
+
+    // Mark as completed if passed and required
+    if (attemptData.passed) {
+      progress.quizCompleted = true;
+      progress.status = "completed";
+      progress.completedAt = new Date();
+      progress.progress = 100;
+
+      // Update module completion stats
+      module.employeesCompleted += 1;
+      module.progress = Math.round(
+        (module.employeesCompleted / module.totalEmployees) * 100
+      );
+    }
+
+    progress.lastAccessedAt = new Date();
+    await progress.save();
+    await module.save();
+
+    // Update quiz analytics
+    await LearningModule.updateQuizAnalytics(moduleId);
+
+    res.json({
+      success: true,
+      message: attemptData.passed ? "Quiz passed!" : "Quiz attempt saved",
+      data: {
+        attemptNumber: progress.currentAttempt,
+        score: attemptData.score,
+        passed: attemptData.passed,
+        progress: progress.progress,
+        bestScore: progress.bestScore,
+        remainingAttempts: maxAttempts - (todaysAttempts.length + 1),
+        quizCompleted: progress.quizCompleted,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error submitting quiz attempt",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/training/:id/quiz/results - Get quiz results for a module
+router.get("/:id/quiz/results", authMiddleware, async (req, res) => {
+  try {
+    const moduleId = req.params.id;
+    const userId = req.user.id;
+
+    const progress = await UserProgress.findOne({ userId, moduleId });
+    if (!progress) {
+      return res.status(404).json({
+        success: false,
+        message: "No quiz attempts found",
+      });
+    }
+
+    // Calculate quiz stats
+    const getQuizStats = () => {
+      const stats = {
+        totalAttempts: progress.quizAttempts?.length || 0,
+        bestScore: progress.bestScore || 0,
+        lastScore:
+          progress.quizAttempts?.length > 0
+            ? progress.quizAttempts[progress.quizAttempts.length - 1].score
+            : 0,
+        averageScore: 0,
+        passed: progress.quizCompleted || false,
+      };
+
+      if (progress.quizAttempts?.length > 0) {
+        const totalScore = progress.quizAttempts.reduce(
+          (sum, attempt) => sum + attempt.score,
+          0
+        );
+        stats.averageScore = Math.round(
+          totalScore / progress.quizAttempts.length
+        );
+      }
+
+      return stats;
+    };
+
+    const quizStats = getQuizStats();
+
+    res.json({
+      success: true,
+      data: {
+        attempts: progress.quizAttempts || [],
+        stats: quizStats,
+        totalAttempts: progress.quizAttempts?.length || 0,
+        bestScore: progress.bestScore || 0,
+        quizCompleted: progress.quizCompleted || false,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching quiz results",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/training/:id/quiz/analytics - Get quiz analytics for admin
+router.get(
+  "/:id/quiz/analytics",
+  authenticateAdmin,
+  staffOnly,
+  async (req, res) => {
+    try {
+      const moduleId = req.params.id;
+
+      const module = await LearningModule.findById(moduleId);
+      if (!module) {
+        return res.status(404).json({
+          success: false,
+          message: "Module not found",
+        });
+      }
+
+      const allProgress = await UserProgress.find({ moduleId }).populate(
+        "userId",
+        "username firstName profileImage"
+      );
+
+      const analytics = {
+        totalAttempts: module.quizAnalytics?.totalAttempts || 0,
+        averageScore: module.quizAnalytics?.averageScore || 0,
+        passRate: module.quizAnalytics?.passRate || 0,
+        averageTimeSpent: module.quizAnalytics?.averageTimeSpent || 0,
+        questionStatistics: module.quizAnalytics?.questionStatistics || [],
+        userPerformance: allProgress.map((progress) => ({
+          user: progress.userId,
+          bestScore: progress.bestScore || 0,
+          totalAttempts: progress.quizAttempts?.length || 0,
+          lastAttempt:
+            progress.quizAttempts?.[progress.quizAttempts?.length - 1]
+              ?.completedAt,
+          quizCompleted: progress.quizCompleted || false,
+        })),
+        moduleInfo: {
+          title: module.title,
+          totalQuestions: module.quiz?.questions?.length || 0,
+          passingScore: module.quiz?.passingScore || 70,
+          totalEnrolled: module.enrollment?.totalEnrolled || 0,
+        },
+      };
+
+      res.json({
+        success: true,
+        data: analytics,
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Error fetching quiz analytics",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// PUT /api/training/:id/quiz - Update module quiz settings (Admin only)
+router.put("/:id/quiz", authenticateAdmin, staffOnly, async (req, res) => {
+  try {
+    const moduleId = req.params.id;
+    const quizData = req.body;
+
+    const module = await LearningModule.findById(moduleId);
+    if (!module) {
+      return res.status(404).json({
+        success: false,
+        message: "Module not found",
+      });
+    }
+
+    // Update quiz data
+    module.quiz = {
+      ...module.quiz,
+      ...quizData,
+      // Ensure questions array is preserved if not provided
+      questions: quizData.questions || module.quiz?.questions || [],
+    };
+
+    // Calculate total points
+    if (module.quiz.questions) {
+      module.quiz.totalPoints = module.quiz.questions.reduce(
+        (total, question) => {
+          return total + (question.points || 1);
+        },
+        0
+      );
+    }
+
+    await module.save();
+
+    res.json({
+      success: true,
+      message: "Quiz updated successfully",
+      data: module.quiz,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error updating quiz",
+      error: error.message,
+    });
+  }
+});
+
+// Legacy quiz submission (for backward compatibility)
 router.post("/:id/quiz", authMiddleware, async (req, res) => {
   try {
     const { answers } = req.body;
@@ -276,7 +656,23 @@ router.post("/:id/quiz", authMiddleware, async (req, res) => {
     const userId = req.user.id;
 
     const module = await LearningModule.findById(moduleId);
-    if (!module || !module.content.quiz || module.content.quiz.length === 0) {
+    if (!module) {
+      return res.status(404).json({
+        success: false,
+        message: "Module not found",
+      });
+    }
+
+    // Check if using new quiz system
+    if (module.quiz?.isEnabled) {
+      return res.status(400).json({
+        success: false,
+        message: "Please use the new quiz attempt endpoint",
+      });
+    }
+
+    // Fallback to legacy quiz system
+    if (!module.content.quiz || module.content.quiz.length === 0) {
       return res.status(404).json({
         success: false,
         message: "Quiz not found for this module",
@@ -355,7 +751,11 @@ router.post("/:id/bookmark", authMiddleware, async (req, res) => {
 
     if (!progress) {
       // Create progress record if doesn't exist
-      progress = new UserProgress({ userId, moduleId });
+      progress = new UserProgress({
+        userId,
+        moduleId,
+        status: "not-started",
+      });
     }
 
     progress.bookmarked = !progress.bookmarked;
@@ -384,7 +784,7 @@ router.get("/user/dashboard", authMiddleware, async (req, res) => {
     const userProgress = await UserProgress.find({ userId })
       .populate(
         "moduleId",
-        "title coverImage category estimatedDuration rating"
+        "title coverImage category estimatedDuration rating quiz"
       )
       .sort({ lastAccessedAt: -1 });
 
@@ -401,6 +801,11 @@ router.get("/user/dashboard", authMiddleware, async (req, res) => {
                 userProgress.length
             )
           : 0,
+      totalQuizzesTaken: userProgress.reduce(
+        (sum, p) => sum + (p.quizAttempts?.length || 0),
+        0
+      ),
+      quizzesPassed: userProgress.filter((p) => p.quizCompleted).length,
     };
 
     // Get bookmarked modules
@@ -409,7 +814,21 @@ router.get("/user/dashboard", authMiddleware, async (req, res) => {
     // Get recent activity
     const recentActivity = userProgress
       .filter((p) => p.lastAccessedAt)
-      .sort((a, b) => b.lastAccessedAt - a.lastAccessedAt)
+      .sort((a, b) => new Date(b.lastAccessedAt) - new Date(a.lastAccessedAt))
+      .slice(0, 5);
+
+    // Get recent quiz attempts
+    const recentQuizAttempts = userProgress
+      .filter((p) => p.quizAttempts && p.quizAttempts.length > 0)
+      .flatMap((p) =>
+        p.quizAttempts.map((attempt) => ({
+          module: p.moduleId,
+          score: attempt.score,
+          passed: attempt.passed,
+          completedAt: attempt.completedAt,
+        }))
+      )
+      .sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt))
       .slice(0, 5);
 
     res.json({
@@ -417,6 +836,7 @@ router.get("/user/dashboard", authMiddleware, async (req, res) => {
       data: {
         stats,
         recentActivity,
+        recentQuizAttempts,
         bookmarked,
         allProgress: userProgress,
       },

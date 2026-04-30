@@ -1,5 +1,6 @@
 import express from "express";
 import Service from "../models/Service.js";
+import Rating from "../models/Rating.js";
 import {
   optionalAuth,
   authMiddleware,
@@ -55,7 +56,7 @@ const buildSortObject = (sortBy, sortOrder) => {
       sortObj = { totalBookings: -1 };
       break;
     case "top-rated":
-      sortObj = { rating: -1, totalRaters: -1 };
+      sortObj = { "rating.average": -1, "rating.totalRaters": -1 };
       break;
     case "newest":
       sortObj = { createdAt: -1 };
@@ -71,7 +72,7 @@ const buildSortObject = (sortBy, sortOrder) => {
       break;
     default:
       // Default sort by serviceId
-      sortObj = { serviceId: 1 };
+      sortObj = { createdAt: -1 };
   }
 
   // Apply custom sort order if provided
@@ -89,10 +90,22 @@ const buildSortObject = (sortBy, sortOrder) => {
 // GET all services with sorting support
 router.get("/", optionalAuth, async (req, res) => {
   try {
-    const { sortBy, sortOrder } = req.query;
+    const { sortBy, sortOrder, category, minRating } = req.query;
+
+    let query = {};
+
+    // Filter by category
+    if (category && category !== "all") {
+      query.category = { $regex: new RegExp(category, "i") };
+    }
+
+    // Filter by minimum rating
+    if (minRating) {
+      query["rating.average"] = { $gte: parseFloat(minRating) };
+    }
 
     // Fetch all services
-    let services = await Service.find({});
+    let services = await Service.find(query);
 
     if (sortBy === "price-low" || sortBy === "price-high") {
       services = services.sort((a, b) => {
@@ -108,7 +121,7 @@ router.get("/", optionalAuth, async (req, res) => {
       });
     } else {
       const sortObj = buildSortObject(sortBy, sortOrder);
-      services = await Service.find({}).sort(sortObj);
+      services = await Service.find(query).sort(sortObj);
     }
 
     res.status(200).json({
@@ -180,7 +193,7 @@ router.get("/category/:category", optionalAuth, async (req, res) => {
       user: req.user
         ? {
             _id: req.user._id,
-            role: req.user.role,
+            role: req.user._id,
             isLoggedIn: true,
           }
         : { isLoggedIn: false },
@@ -235,6 +248,9 @@ router.get("/:id", optionalAuth, async (req, res) => {
       });
     }
 
+    // Update rating stats in case they're outdated
+    await service.updateRatingStats();
+
     res.status(200).json({
       success: true,
       message: "Service retrieved successfully",
@@ -251,6 +267,106 @@ router.get("/:id", optionalAuth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error retrieving service",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/:id/ratings - Get service ratings
+router.get("/:id/ratings", optionalAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { page = 1, limit = 10, rating } = req.query;
+
+    const service = await Service.findById(id);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    const skip = (page - 1) * limit;
+    const query = {
+      "ratedEntity.type": "service",
+      "ratedEntity.id": id,
+      status: "active",
+    };
+
+    if (rating) {
+      query.rating = parseInt(rating);
+    }
+
+    const ratings = await Rating.find(query)
+      .populate("rater", "username firstName profileImage")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Rating.countDocuments(query);
+
+    // Update service rating stats
+    await service.updateRatingStats();
+
+    res.json({
+      success: true,
+      data: {
+        service: {
+          _id: service._id,
+          name: service.name,
+          rating: service.rating,
+        },
+        ratings,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving service ratings",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/featured/top-rated - Get top rated services
+router.get("/featured/top-rated", optionalAuth, async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+
+    const services = await Service.find({
+      "rating.totalRaters": { $gt: 0 },
+      "rating.average": { $gte: 4.0 },
+    })
+      .sort({
+        "rating.average": -1,
+        "rating.totalRaters": -1,
+        totalBookings: -1,
+      })
+      .limit(parseInt(limit));
+
+    res.status(200).json({
+      success: true,
+      message: "Top rated services retrieved successfully",
+      data: services,
+      total: services.length,
+      user: req.user
+        ? {
+            _id: req.user._id,
+            role: req.user.role,
+            isLoggedIn: true,
+          }
+        : { isLoggedIn: false },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving top rated services",
       error: error.message,
     });
   }
@@ -289,6 +405,37 @@ router.post("/:id/book", authMiddleware, customerOnly, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error booking service",
+      error: error.message,
+    });
+  }
+});
+
+// @desc    Update service rating stats manually
+// @route   PUT /api/services/:id/update-rating
+// @access  Public
+router.put("/:id/update-rating", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const service = await Service.findById(id);
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    await service.updateRatingStats();
+
+    res.json({
+      success: true,
+      message: "Service rating stats updated successfully",
+      data: service,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error updating service rating stats",
       error: error.message,
     });
   }

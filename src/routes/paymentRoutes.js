@@ -67,6 +67,23 @@ router.get("/stats/overview", authMiddleware, staffOnly, async (req, res) => {
       createdAt: { $gte: start, $lte: end },
     });
 
+    // Get downpayment stats
+    const downpaymentStats = await Payment.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: start, $lte: end },
+          paymentFor: { $in: ["downpayment", "remaining"] },
+        },
+      },
+      {
+        $group: {
+          _id: "$paymentFor",
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]);
+
     console.log("✅ Statistics fetched");
 
     res.json({
@@ -75,6 +92,7 @@ router.get("/stats/overview", authMiddleware, staffOnly, async (req, res) => {
         period: { startDate: start, endDate: end },
         stats,
         autoApprovedCount,
+        downpaymentStats,
       },
     });
   } catch (error) {
@@ -94,7 +112,7 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
     console.log("Request body:", req.body);
     console.log("User:", req.user._id);
 
-    const { bookingId, orderId, paymentMethod } = req.body;
+    const { bookingId, orderId, paymentMethod, paymentFor = "full" } = req.body;
 
     let amount = 0;
     let paymentType = "";
@@ -118,9 +136,40 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
         });
       }
 
-      amount = booking.totalAmount;
-      paymentType = "booking";
-      console.log("✅ Booking found, amount:", amount);
+      // Determine amount based on payment type
+      if (
+        paymentFor === "downpayment" &&
+        booking.paymentOption === "downpayment"
+      ) {
+        amount = booking.downpaymentAmount;
+        paymentType = "booking_downpayment";
+      } else if (
+        paymentFor === "remaining" &&
+        booking.paymentOption === "downpayment"
+      ) {
+        // Check if downpayment was already paid
+        if (booking.amountPaid < booking.downpaymentAmount) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Downpayment must be paid first before paying remaining amount",
+          });
+        }
+        amount = booking.remainingAmount;
+        paymentType = "booking_remaining";
+      } else {
+        amount = booking.totalAmount;
+        paymentType = "booking_full";
+      }
+
+      console.log("✅ Booking found, payment details:", {
+        totalAmount: booking.totalAmount,
+        downpaymentAmount: booking.downpaymentAmount,
+        remainingAmount: booking.remainingAmount,
+        amountPaid: booking.amountPaid,
+        paymentFor,
+        amountToPay: amount,
+      });
     } else if (orderId) {
       const order = await Order.findById(orderId);
       if (!order) {
@@ -158,6 +207,8 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
       paymentType,
       amount,
       paymentMethod,
+      paymentFor,
+      isDownpayment: paymentFor === "downpayment",
     });
 
     // Generate QR code data
@@ -169,7 +220,9 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
 
     // Update booking or order with payment reference
     if (bookingId) {
-      await Booking.findByIdAndUpdate(bookingId, { payment: payment._id });
+      await Booking.findByIdAndUpdate(bookingId, {
+        $push: { payments: payment._id },
+      });
     } else if (orderId) {
       await Order.findByIdAndUpdate(orderId, { payment: payment._id });
     }
@@ -182,6 +235,7 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
         paymentReference: payment.paymentReference,
         amount: payment.amount,
         paymentMethod: payment.paymentMethod,
+        paymentFor: payment.paymentFor,
         status: payment.status,
         qrCode: payment.qrCode,
         customer: payment.customer,
@@ -200,6 +254,96 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
   }
 });
 
+// POST /api/payments/:id/pay-remaining - Create payment for remaining amount
+router.post(
+  "/:id/pay-remaining",
+  authMiddleware,
+  customerOnly,
+  async (req, res) => {
+    try {
+      console.log("💳 Creating remaining payment for booking:", req.params.id);
+
+      const { paymentMethod } = req.body;
+
+      const booking = await Booking.findById(req.params.id);
+
+      if (!booking) {
+        return res.status(404).json({
+          success: false,
+          message: "Booking not found",
+        });
+      }
+
+      if (booking.customer.toString() !== req.user._id.toString()) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied",
+        });
+      }
+
+      if (booking.paymentOption !== "downpayment") {
+        return res.status(400).json({
+          success: false,
+          message: "This booking is not using downpayment option",
+        });
+      }
+
+      if (booking.amountPaid < booking.downpaymentAmount) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Downpayment must be paid first before paying remaining amount",
+        });
+      }
+
+      if (booking.remainingAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "No remaining amount to pay",
+        });
+      }
+
+      // Create remaining payment
+      const payment = new Payment({
+        booking: booking._id,
+        customer: req.user._id,
+        paymentType: "booking_remaining",
+        amount: booking.remainingAmount,
+        paymentMethod,
+        paymentFor: "remaining",
+      });
+
+      payment.generateQRCode();
+      await payment.save();
+
+      // Add to booking's payments array
+      await Booking.findByIdAndUpdate(booking._id, {
+        $push: { payments: payment._id },
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "Remaining payment created successfully",
+        data: {
+          _id: payment._id,
+          paymentReference: payment.paymentReference,
+          amount: payment.amount,
+          paymentMethod: payment.paymentMethod,
+          status: payment.status,
+          qrCode: payment.qrCode,
+        },
+      });
+    } catch (error) {
+      console.error("❌ Error creating remaining payment:", error);
+      res.status(400).json({
+        success: false,
+        message: "Error creating remaining payment",
+        error: error.message,
+      });
+    }
+  }
+);
+
 // GET /api/payments - Get all payments (admin) or user's payments
 router.get("/", authMiddleware, async (req, res) => {
   try {
@@ -212,11 +356,12 @@ router.get("/", authMiddleware, async (req, res) => {
       query.customer = req.user._id;
     }
 
-    const { status, paymentMethod, startDate, endDate } = req.query;
+    const { status, paymentMethod, paymentFor, startDate, endDate } = req.query;
 
     // Add filters
     if (status) query.status = status;
     if (paymentMethod) query.paymentMethod = paymentMethod;
+    if (paymentFor) query.paymentFor = paymentFor;
     if (startDate && endDate) {
       query.createdAt = {
         $gte: new Date(startDate),
@@ -226,7 +371,7 @@ router.get("/", authMiddleware, async (req, res) => {
 
     const payments = await Payment.find(query)
       .populate("customer", "username email")
-      .populate("booking", "preferredDate preferredTime")
+      .populate("booking", "preferredDate preferredTime paymentOption")
       .populate("order", "orderNumber")
       .populate("processedBy", "username")
       .sort({ createdAt: -1 });
@@ -327,16 +472,6 @@ router.post(
             autoApprovalResult.approved ? "APPROVED ✅" : "PENDING ⏳"
           } (Score: ${autoApprovalResult.score}/100)`
         );
-
-        if (autoApprovalResult.approved) {
-          // Update booking status if payment is approved
-          if (payment.booking) {
-            await Booking.findByIdAndUpdate(payment.booking, {
-              status: "confirmed",
-              paymentStatus: "paid",
-            });
-          }
-        }
       } else {
         console.log("👤 Admin is online - manual review required");
         payment.lastAdminCheck = new Date();
@@ -369,7 +504,6 @@ router.post(
   }
 );
 
-// 🔧 FIX: Enhanced status endpoint with detailed logging
 // GET /api/payments/:id/status - Get payment status (for polling)
 router.get("/:id/status", authMiddleware, async (req, res) => {
   try {
@@ -377,7 +511,7 @@ router.get("/:id/status", authMiddleware, async (req, res) => {
 
     const payment = await Payment.findById(req.params.id)
       .select(
-        "status autoApproved verificationScore processingNotes autoApprovalReason processedAt processedBy"
+        "status autoApproved verificationScore processingNotes autoApprovalReason processedAt processedBy paymentFor"
       )
       .populate("processedBy", "username")
       .lean();
@@ -391,9 +525,10 @@ router.get("/:id/status", authMiddleware, async (req, res) => {
     }
 
     console.log("✅ [STATUS CHECK] Current status:", payment.status);
-    console.log("📊 [STATUS CHECK] Full payment data:", {
+    console.log("📊 [STATUS CHECK] Payment details:", {
       id: req.params.id,
       status: payment.status,
+      paymentFor: payment.paymentFor,
       autoApproved: payment.autoApproved,
       processedBy: payment.processedBy?.username,
       processedAt: payment.processedAt,
@@ -403,6 +538,7 @@ router.get("/:id/status", authMiddleware, async (req, res) => {
       success: true,
       data: {
         status: payment.status,
+        paymentFor: payment.paymentFor,
         autoApproved: payment.autoApproved || false,
         verificationScore: payment.verificationScore || 0,
         processingNotes: payment.processingNotes || "",
@@ -468,7 +604,6 @@ router.get("/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// 🔧 FIX: Enhanced approve endpoint with better logging
 // PUT /api/payments/:id/approve - Approve payment (admin only)
 router.put("/:id/approve", authMiddleware, staffOnly, async (req, res) => {
   try {
@@ -494,6 +629,7 @@ router.put("/:id/approve", authMiddleware, staffOnly, async (req, res) => {
     console.log("📝 [ADMIN APPROVE] Payment before approval:", {
       status: payment.status,
       autoApproved: payment.autoApproved,
+      paymentFor: payment.paymentFor,
     });
 
     // Override auto-approval if admin manually approves

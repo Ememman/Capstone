@@ -1,4 +1,4 @@
-// middleware/auth.js
+// middleware/auth.js - ENHANCED for Salon Staff functionality
 import jwt from "jsonwebtoken";
 import User from "../models/User.js";
 
@@ -90,6 +90,17 @@ export const authMiddleware = async (req, res, next) => {
       });
     }
 
+    // ✅ NEW: Update last activity for staff/admin users
+    if (user.role === "salon_staff" || user.role === "admin") {
+      try {
+        user.lastActivity = new Date();
+        await user.save({ validateBeforeSave: false });
+        console.log(`✅ Updated activity for ${user.role}: ${user.username}`);
+      } catch (activityError) {
+        console.warn("Could not update user activity:", activityError.message);
+      }
+    }
+
     // Attach user to request object
     req.user = user;
     req.token = token;
@@ -148,6 +159,16 @@ export const optionalAuth = async (req, res, next) => {
     if (user.isAccountLocked && user.isAccountLocked()) {
       req.user = null;
       return next();
+    }
+
+    // ✅ NEW: Update last activity for staff/admin users (optional auth)
+    if (user.role === "salon_staff" || user.role === "admin") {
+      try {
+        user.lastActivity = new Date();
+        await user.save({ validateBeforeSave: false });
+      } catch (activityError) {
+        console.warn("Could not update user activity:", activityError.message);
+      }
     }
 
     // Attach user to request object
@@ -209,7 +230,7 @@ export const customerOnly = (req, res, next) => {
   next();
 };
 
-// Staff only middleware (for backward compatibility)
+// Staff only middleware (ENHANCED for Salon Staff)
 export const staffOnly = (req, res, next) => {
   if (!req.user) {
     return res.status(401).json({
@@ -228,10 +249,19 @@ export const staffOnly = (req, res, next) => {
     });
   }
 
+  // ✅ NEW: Check if staff account is active
+  if (req.user.isActive === false) {
+    return res.status(403).json({
+      success: false,
+      message: "Access denied. Staff account is deactivated.",
+      error: "ACCOUNT_DEACTIVATED",
+    });
+  }
+
   next();
 };
 
-// Admin middleware (for backward compatibility)
+// Admin middleware (ENHANCED)
 export const adminOnly = (req, res, next) => {
   if (!req.user) {
     return res.status(401).json({
@@ -246,6 +276,50 @@ export const adminOnly = (req, res, next) => {
       success: false,
       message: "Access denied. Admin account required.",
       error: "ADMIN_ONLY",
+      userRole: req.user.role,
+    });
+  }
+
+  next();
+};
+
+// ✅ NEW: Staff or Admin middleware (for shared functionality)
+export const staffOrAdmin = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      message: "Access denied. Authentication required.",
+      error: "NO_AUTH",
+    });
+  }
+
+  if (!["salon_staff", "admin"].includes(req.user.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "Access denied. Staff or admin account required.",
+      error: "STAFF_OR_ADMIN_ONLY",
+      userRole: req.user.role,
+    });
+  }
+
+  next();
+};
+
+// ✅ NEW: Customer or Staff middleware (for some shared features)
+export const customerOrStaff = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      message: "Access denied. Authentication required.",
+      error: "NO_AUTH",
+    });
+  }
+
+  if (!["customer", "salon_staff"].includes(req.user.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "Access denied. Customer or staff account required.",
+      error: "CUSTOMER_OR_STAFF_ONLY",
       userRole: req.user.role,
     });
   }
@@ -284,6 +358,15 @@ export const requireActiveAccount = (req, res, next) => {
       success: false,
       message: "Password change required.",
       error: "PASSWORD_CHANGE_REQUIRED",
+    });
+  }
+
+  // ✅ NEW: Check if staff account is active
+  if (req.user.role === "salon_staff" && req.user.isActive === false) {
+    return res.status(403).json({
+      success: false,
+      message: "Access denied. Staff account is deactivated.",
+      error: "ACCOUNT_DEACTIVATED",
     });
   }
 
@@ -394,6 +477,162 @@ export const validateJWTConfig = (req, res, next) => {
   next();
 };
 
+// ✅ NEW: Online status check for staff/admin
+export const checkOnlineStatus = async (req, res, next) => {
+  if (!req.user || !["salon_staff", "admin"].includes(req.user.role)) {
+    return next();
+  }
+
+  try {
+    // Check if user was active in the last 15 minutes
+    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+    const isOnline =
+      req.user.lastActivity && req.user.lastActivity > fifteenMinutesAgo;
+
+    // Attach online status to request
+    req.user.isOnline = isOnline;
+
+    next();
+  } catch (error) {
+    console.warn("Online status check failed:", error.message);
+    req.user.isOnline = false;
+    next();
+  }
+};
+
+// ✅ NEW: Permission-based middleware for staff features
+export const requireStaffPermission = (permission) => {
+  return (req, res, next) => {
+    if (!req.user || req.user.role !== "salon_staff") {
+      return res.status(403).json({
+        success: false,
+        message: "Staff access required.",
+        error: "STAFF_ACCESS_REQUIRED",
+      });
+    }
+
+    // Define staff permissions based on position/role
+    const staffPermissions = {
+      // Basic permissions for all staff
+      basic: ["view_appointments", "clock_in_out", "view_learning_modules"],
+
+      // Senior stylist permissions
+      senior: ["manage_appointments", "train_junior_staff", "approve_work"],
+
+      // Manager permissions
+      manager: ["manage_staff", "view_reports", "manage_inventory"],
+    };
+
+    // Check if user has the required permission
+    let userPermissions = staffPermissions.basic;
+
+    if (req.user.position?.toLowerCase().includes("manager")) {
+      userPermissions = [
+        ...userPermissions,
+        ...staffPermissions.manager,
+        ...staffPermissions.senior,
+      ];
+    } else if (req.user.position?.toLowerCase().includes("senior")) {
+      userPermissions = [...userPermissions, ...staffPermissions.senior];
+    }
+
+    if (!userPermissions.includes(permission)) {
+      return res.status(403).json({
+        success: false,
+        message: `Insufficient permissions. Required: ${permission}`,
+        error: "INSUFFICIENT_PERMISSIONS",
+        userPosition: req.user.position,
+        requiredPermission: permission,
+      });
+    }
+
+    next();
+  };
+};
+
+// ✅ NEW: GPS location validation middleware for attendance
+export const validateLocation = (req, res, next) => {
+  const { latitude, longitude } = req.body;
+
+  if (!latitude || !longitude) {
+    return res.status(400).json({
+      success: false,
+      message: "Location coordinates (latitude and longitude) are required.",
+      error: "LOCATION_REQUIRED",
+    });
+  }
+
+  // Validate coordinate ranges
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid location coordinates provided.",
+      error: "INVALID_COORDINATES",
+    });
+  }
+
+  next();
+};
+
+// ✅ NEW: Guest access middleware (for guest users)
+export const guestOrAuth = async (req, res, next) => {
+  try {
+    const token = extractToken(req);
+
+    if (!token) {
+      // No token, treat as guest
+      req.user = null;
+      req.isGuest = true;
+      return next();
+    }
+
+    // Verify token if present
+    const decoded = verifyToken(token);
+    const user = await User.findById(decoded.userId).select("-password");
+
+    if (!user) {
+      req.user = null;
+      req.isGuest = true;
+      return next();
+    }
+
+    req.user = user;
+    req.token = token;
+    req.isGuest = user.isGuest || false;
+
+    next();
+  } catch (error) {
+    console.warn("Guest or auth warning:", error.message);
+    req.user = null;
+    req.isGuest = true;
+    next();
+  }
+};
+
+// ✅ NEW: Registration completion check
+export const requireRegistrationComplete = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+      error: "NO_AUTH",
+    });
+  }
+
+  if (req.user.registrationStep !== "completed" && !req.user.isGuest) {
+    return res.status(403).json({
+      success: false,
+      message:
+        "Please complete your registration before accessing this feature.",
+      error: "REGISTRATION_INCOMPLETE",
+      currentStep: req.user.registrationStep,
+    });
+  }
+
+  next();
+};
+
+// Alias for backward compatibility
 export const protect = authMiddleware;
 
 export default {
@@ -403,9 +642,16 @@ export default {
   customerOnly,
   staffOnly,
   adminOnly,
+  staffOrAdmin,
+  customerOrStaff,
   requireActiveAccount,
   rateLimitAuth,
   refreshTokenIfNeeded,
   validateJWTConfig,
+  checkOnlineStatus,
+  requireStaffPermission,
+  validateLocation,
+  guestOrAuth,
+  requireRegistrationComplete,
   protect,
 };

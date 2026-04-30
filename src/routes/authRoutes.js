@@ -1,19 +1,36 @@
+// routes/authRoutes.js - UPDATED with activity tracking
 import express from "express";
 import User from "../models/User.js";
 import jwt from "jsonwebtoken";
 import { verifyGoogleToken, verifyFacebookToken } from "../utils/socialAuth.js";
-import twilio from "twilio";
-import nodemailer from "nodemailer";
+import notificationService from "../services/notificationService.js";
+import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
-import { createRequire } from "module";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import bcrypt from "bcryptjs";
 
-// Load environment variables
 dotenv.config();
 
 const router = express.Router();
+
+// ✅ Console startup message
+console.log("📱 SMS Mode: All SMS codes will appear in TERMINAL ONLY");
+console.log("📧 Email Mode: Using notificationService (Gmail/SMTP)");
+
+// ✅ RATE LIMITER for OTP requests (prevent abuse)
+const otpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 requests per IP
+  message: {
+    success: false,
+    message:
+      "Too many OTP requests from this IP, please try again in 15 minutes",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Middleware to authenticate token
 const authenticateToken = async (req, res, next) => {
@@ -28,73 +45,20 @@ const authenticateToken = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.userId); // FIXED: Use decoded.userId
+    const user = await User.findById(decoded.userId);
     if (!user) {
       return res
         .status(404)
         .json({ success: false, message: "User not found" });
     }
-    req.user = user; // Attach full user object
+    req.user = user;
     next();
   } catch (err) {
     return res.status(403).json({ success: false, message: "Invalid token" });
   }
 };
 
-// Initialize Twilio client (optional - for SMS sending)
-let twilioClient = null;
-if (
-  process.env.TWILIO_ACCOUNT_SID &&
-  process.env.TWILIO_ACCOUNT_SID.startsWith("AC") &&
-  process.env.TWILIO_AUTH_TOKEN &&
-  process.env.TWILIO_PHONE_NUMBER
-) {
-  try {
-    twilioClient = twilio(
-      process.env.TWILIO_ACCOUNT_SID,
-      process.env.TWILIO_AUTH_TOKEN
-    );
-    console.log("Twilio client initialized successfully");
-  } catch (error) {
-    console.error("Failed to initialize Twilio client:", error.message);
-    twilioClient = null;
-  }
-} else {
-  console.warn(
-    "Twilio credentials not configured. SMS features will be disabled."
-  );
-}
-
-// Initialize Nodemailer transporter (optional - for email sending)
-let emailTransporter = null;
-if (
-  process.env.EMAIL_HOST &&
-  process.env.EMAIL_USER &&
-  process.env.EMAIL_PASS
-) {
-  try {
-    emailTransporter = nodemailer.createTransport({
-      host: process.env.EMAIL_HOST,
-      port: parseInt(process.env.EMAIL_PORT) || 587,
-      secure: false,
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-    });
-
-    console.log("Email transporter initialized successfully");
-  } catch (error) {
-    console.error("Failed to initialize email transporter:", error.message);
-    emailTransporter = null;
-  }
-} else {
-  console.warn(
-    "Email credentials not configured. Email features will be disabled."
-  );
-}
-
-// FIXED: Generate token with userId
+// Generate token with userId
 const generateToken = (userId) => {
   return jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: "15d" });
 };
@@ -102,21 +66,19 @@ const generateToken = (userId) => {
 // Helper function to generate username suggestions
 const generateUsernameSuggestions = (baseUsername) => {
   const suggestions = [];
-  const randomNumbers = Math.floor(100 + Math.random() * 900); // 3 random digits
+  const randomNumbers = Math.floor(100 + Math.random() * 900);
 
-  // Add some variations
   suggestions.push(`${baseUsername}${randomNumbers}`);
   suggestions.push(`${baseUsername}_${Math.floor(10 + Math.random() * 90)}`);
   suggestions.push(`TheReal${baseUsername}`);
   suggestions.push(`${baseUsername}Official`);
 
-  return suggestions.slice(0, 3); // Return max 3 suggestions
+  return suggestions.slice(0, 3);
 };
 
 // Configure multer for image uploads
 const uploadDir = path.join(process.cwd(), "uploads", "profile-images");
 
-// Create upload directory if it doesn't exist
 try {
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -138,7 +100,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith("image/")) {
       cb(null, true);
@@ -147,6 +109,74 @@ const upload = multer({
     }
   },
 });
+
+// ✅ FIXED: Helper function for progressive delay system - PROPERLY IMPLEMENTED
+async function handleFailedLoginWithProgressiveDelay(user) {
+  try {
+    console.log(
+      "🔐 Handling failed login with progressive delay for user:",
+      user.username
+    );
+
+    // Increment failed attempts
+    user.security.failedLoginAttempts =
+      (user.security.failedLoginAttempts || 0) + 1;
+    user.security.lastFailedLogin = new Date();
+
+    const attempts = user.security.failedLoginAttempts;
+    let delaySeconds = 0;
+    let shouldShowDelay = false;
+
+    // ✅ FIXED: CORRECT progressive delays based on exact requirements
+    if (attempts === 4) {
+      // 4th attempt: 10 seconds delay
+      delaySeconds = 10;
+      shouldShowDelay = true;
+      console.log(`⏰ 4th failed attempt - Applying 10-second delay`);
+    } else if (attempts === 8) {
+      // 8th attempt: 15 seconds delay
+      delaySeconds = 15;
+      shouldShowDelay = true;
+      console.log(`⏰ 8th failed attempt - Applying 15-second delay`);
+    } else if (attempts >= 9) {
+      // 9th+ attempts: Progressive increase
+      const additionalDelays = [20, 25, 30, 40, 50, 60];
+      const delayIndex = Math.min(attempts - 9, additionalDelays.length - 1);
+      delaySeconds = additionalDelays[delayIndex];
+      shouldShowDelay = true;
+      console.log(
+        `⏰ ${attempts}th failed attempt - Applying ${delaySeconds}-second delay`
+      );
+    } else {
+      // 1st-3rd, 5th-7th attempts: No delay, just error message
+      delaySeconds = 0;
+      shouldShowDelay = false;
+      console.log(`⚠️ ${attempts}th failed attempt - No delay applied`);
+    }
+
+    user.security.delaySeconds = delaySeconds;
+
+    // ✅ FIXED: Only set nextAllowedLogin if there's an actual delay
+    if (delaySeconds > 0) {
+      user.security.nextAllowedLogin = new Date(
+        Date.now() + delaySeconds * 1000
+      );
+      console.log(
+        `⏰ Next login allowed after: ${user.security.nextAllowedLogin}`
+      );
+    } else {
+      user.security.nextAllowedLogin = undefined;
+    }
+
+    await user.save({ validateBeforeSave: false });
+
+    return { delaySeconds, shouldShowDelay };
+  } catch (error) {
+    console.error("❌ Error handling failed login with delay:", error);
+    return { delaySeconds: 0, shouldShowDelay: false };
+  }
+}
+
 // @route   POST /api/auth/setup-profile
 // @desc    Setup username, first name, and profile image
 // @access  Public
@@ -157,7 +187,6 @@ router.post(
     try {
       const { userId, username, firstName } = req.body;
 
-      // Validate required fields
       if (!userId || !username || !firstName) {
         return res.status(400).json({
           success: false,
@@ -191,7 +220,6 @@ router.post(
         });
       }
 
-      // Allow profile setup even if registration step is not exactly "profile_setup"
       if (!user.verification.phoneVerified) {
         return res.status(400).json({
           success: false,
@@ -199,11 +227,9 @@ router.post(
         });
       }
 
-      // Prepare profile image path
       let profileImagePath = null;
       if (req.file) {
         try {
-          // Verify file exists
           await fs.promises.access(req.file.path);
           profileImagePath = `/uploads/profile-images/${req.file.filename}`;
           console.log(`File uploaded successfully: ${req.file.path}`);
@@ -219,13 +245,18 @@ router.post(
         profileImagePath = `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
       }
 
-      // Update user in database
       user.username = username;
       user.firstName = firstName;
       user.profileImage = profileImagePath;
       user.registrationStep = "email_setup";
 
       await user.save({ validateBeforeSave: false });
+
+      // Track profile setup activity
+      await notificationService.trackUserActivity(user._id, "profile_updated", {
+        username: user.username,
+        firstName: user.firstName,
+      });
 
       res.status(200).json({
         success: true,
@@ -242,7 +273,6 @@ router.post(
     } catch (error) {
       console.error("Setup profile error:", error);
 
-      // Clean up uploaded file if database operation fails
       if (req.file) {
         try {
           await fs.promises.unlink(req.file.path);
@@ -281,14 +311,12 @@ router.post("/check-username", async (req, res) => {
       });
     }
 
-    // Check if username exists (excluding temporary users)
     const existingUser = await User.findOne({
       username,
-      email: { $not: /@temp\.com$/ }, // Exclude temporary users
+      email: { $not: /@temp\.com$/ },
     });
 
     if (existingUser) {
-      // Generate suggestions
       const suggestions = generateUsernameSuggestions(username);
 
       return res.status(200).json({
@@ -366,7 +394,9 @@ router.post("/check-password-strength", (req, res) => {
       message: "Internal server error",
     });
   }
-}); // @route   GET /api/auth/roles
+});
+
+// @route   GET /api/auth/roles
 // @desc    Get available roles for login
 // @access  Public
 router.get("/roles", (req, res) => {
@@ -407,13 +437,9 @@ router.post("/guest", async (req, res) => {
     const timestamp = Date.now();
     const randomStr = Math.random().toString(36).substr(2, 9);
     const guestId = `${timestamp}${randomStr}`;
-
-    // Generate unique phone number for guest (using timestamp)
     const uniquePhone = `99${timestamp.toString().slice(-9)}`;
-
-    // Generate password: 8-20 chars with uppercase, lowercase, number, and symbol
-    const randomPart = Math.random().toString(36).substr(2, 5); // 5 random chars
-    const guestPassword = `Guest${randomPart}1!`; // Total: 5+5+2 = 12 chars
+    const randomPart = Math.random().toString(36).substr(2, 5);
+    const guestPassword = `Guest${randomPart}1!`;
 
     const guestUser = new User({
       username: `Guest_${randomStr}`,
@@ -550,6 +576,13 @@ router.post("/convert-guest", async (req, res) => {
 
     await user.save();
 
+    // Track guest conversion activity
+    await notificationService.trackUserActivity(user._id, "user_registered", {
+      username: user.username,
+      email: user.email,
+      convertedFromGuest: true,
+    });
+
     const token = generateToken(user._id);
 
     res.status(200).json({
@@ -577,11 +610,11 @@ router.post("/convert-guest", async (req, res) => {
 });
 
 // @route   GET /api/auth/profile
-// @desc    Get current user profile (including guest status)
+// @desc    Get current user profile
 // @access  Private
 router.get("/profile", authenticateToken, async (req, res) => {
   try {
-    const user = req.user; // Now full user from middleware
+    const user = req.user;
 
     res.status(200).json({
       success: true,
@@ -604,8 +637,187 @@ router.get("/profile", authenticateToken, async (req, res) => {
       message: "Internal server error",
     });
   }
-}); // @route   POST /api/auth/register
-// @desc    Register a new user
+});
+
+// @route   PUT /api/auth/profile
+// @desc    Update user profile
+// @access  Private
+router.put("/profile", authenticateToken, async (req, res) => {
+  try {
+    const { username, email, phoneNumber } = req.body;
+    const user = req.user;
+
+    if (username && username !== user.username) {
+      const existingUsername = await User.findOne({
+        username,
+        _id: { $ne: user._id },
+      });
+      if (existingUsername) {
+        return res.status(400).json({
+          success: false,
+          message: "Username already taken",
+        });
+      }
+    }
+
+    if (email && email !== user.email) {
+      const existingEmail = await User.findOne({
+        email,
+        _id: { $ne: user._id },
+      });
+      if (existingEmail) {
+        return res.status(400).json({
+          success: false,
+          message: "Email already taken",
+        });
+      }
+    }
+
+    if (phoneNumber && phoneNumber !== user.phoneNumber) {
+      const existingPhone = await User.findOne({
+        phoneNumber,
+        _id: { $ne: user._id },
+      });
+      if (existingPhone) {
+        return res.status(400).json({
+          success: false,
+          message: "Phone number already taken",
+        });
+      }
+    }
+
+    if (username) user.username = username;
+    if (email) user.email = email;
+    if (phoneNumber) user.phoneNumber = phoneNumber;
+
+    await user.save({ validateBeforeSave: false });
+
+    // Track profile update activity
+    await notificationService.trackUserActivity(user._id, "profile_updated", {
+      username: user.username,
+      email: user.email,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Profile updated successfully",
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        profileImage: user.profileImage,
+        role: user.role,
+        isGuest: user.isGuest || false,
+        createdAt: user.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update profile",
+      error: error.message,
+    });
+  }
+});
+
+// @route   POST /api/auth/profile/picture
+// @desc    Update user profile picture
+// @access  Private
+router.post(
+  "/profile/picture",
+  authenticateToken,
+  upload.single("profileImage"),
+  async (req, res) => {
+    try {
+      console.log("📸 Profile picture upload request received");
+      console.log("User ID:", req.user._id);
+      console.log("File:", req.file);
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: "No image file provided",
+        });
+      }
+
+      const user = req.user;
+
+      if (user.profileImage && !user.profileImage.includes("dicebear")) {
+        try {
+          if (user.profileImage.startsWith("/uploads")) {
+            const oldImagePath = path.join(
+              process.cwd(),
+              user.profileImage.replace(/^\//, "")
+            );
+            if (fs.existsSync(oldImagePath)) {
+              fs.unlinkSync(oldImagePath);
+              console.log("🗑️ Deleted old profile image:", oldImagePath);
+            }
+          }
+        } catch (deleteError) {
+          console.warn("⚠️ Could not delete old image:", deleteError.message);
+        }
+      }
+
+      const imageUrl = `/uploads/profile-images/${req.file.filename}`;
+      user.profileImage = imageUrl;
+      await user.save({ validateBeforeSave: false });
+
+      // Track profile picture update activity
+      await notificationService.trackUserActivity(
+        user._id,
+        "profile_picture_updated"
+      );
+
+      console.log("✅ Profile picture updated successfully");
+      console.log("New image URL:", imageUrl);
+
+      res.json({
+        success: true,
+        message: "Profile picture updated successfully",
+        user: {
+          id: user._id,
+          username: user.username,
+          email: user.email,
+          phoneNumber: user.phoneNumber,
+          profileImage: user.profileImage,
+          role: user.role,
+          isGuest: user.isGuest || false,
+          createdAt: user.createdAt,
+        },
+      });
+    } catch (error) {
+      console.error("❌ Error uploading profile picture:", error);
+
+      if (req.file) {
+        try {
+          const filePath = path.join(
+            process.cwd(),
+            "uploads/profile-images",
+            req.file.filename
+          );
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            console.log("🧹 Cleaned up failed upload:", filePath);
+          }
+        } catch (cleanupError) {
+          console.warn("⚠️ Could not clean up file:", cleanupError.message);
+        }
+      }
+
+      res.status(500).json({
+        success: false,
+        message: "Failed to upload profile picture",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// @route   POST /api/auth/register
+// @desc    Register a new user (legacy)
 // @access  Public
 router.post("/register", async (req, res) => {
   try {
@@ -691,6 +903,12 @@ router.post("/register", async (req, res) => {
 
     await user.save();
 
+    // Track user registration activity
+    await notificationService.trackUserActivity(user._id, "user_registered", {
+      username: user.username,
+      email: user.email,
+    });
+
     const token = generateToken(user._id);
 
     res.status(201).json({
@@ -732,12 +950,10 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// @route   POST /api/auth/send-phone-otp
-// @desc    Send OTP to phone number for registration
-// @access  Public
-router.post("/send-phone-otp", async (req, res) => {
+// ✅ UPDATED: Send Phone OTP (SMS TERMINAL ONLY)
+router.post("/send-phone-otp", otpLimiter, async (req, res) => {
   try {
-    const { phoneNumber, role } = req.body;
+    const { phoneNumber, role, email } = req.body;
 
     if (!phoneNumber || !role) {
       return res.status(400).json({
@@ -746,7 +962,6 @@ router.post("/send-phone-otp", async (req, res) => {
       });
     }
 
-    // Check for proper 11-digit format starting with 0
     if (!/^0\d{10}$/.test(phoneNumber)) {
       return res.status(400).json({
         success: false,
@@ -754,7 +969,6 @@ router.post("/send-phone-otp", async (req, res) => {
       });
     }
 
-    // Only check for verified users to prevent blocking unverified registrations
     const existingVerifiedUser = await User.findOne({
       phoneNumber,
       "verification.phoneVerified": true,
@@ -767,7 +981,6 @@ router.post("/send-phone-otp", async (req, res) => {
       });
     }
 
-    // Find existing unverified user or create new one
     let user = await User.findOne({
       phoneNumber,
       "verification.phoneVerified": false,
@@ -778,7 +991,7 @@ router.post("/send-phone-otp", async (req, res) => {
         phoneNumber,
         role,
         username: `temp_${phoneNumber}`,
-        email: `temp_${phoneNumber}@temp.com`,
+        email: email || `temp_${phoneNumber}@temp.com`,
         password: "TempPassword123!",
         registrationStep: "phone_verification",
         isGuest: false,
@@ -799,48 +1012,28 @@ router.post("/send-phone-otp", async (req, res) => {
     const otp = user.generatePhoneOTP();
     await user.save({ validateBeforeSave: false });
 
-    // Send SMS via Twilio if configured
-    if (twilioClient && process.env.TWILIO_PHONE_NUMBER) {
-      try {
-        // Format phone number for Twilio (Philippines: +63XXXXXXXXX)
-        const formattedPhone = phoneNumber.startsWith("0")
-          ? `+63${phoneNumber.substring(1)}`
-          : phoneNumber;
+    // ✅ SMS: ONLY LOG TO TERMINAL (NO ACTUAL SENDING)
+    console.log("\n" + "=".repeat(60));
+    console.log("📱 [SMS VERIFICATION CODE - TERMINAL ONLY]");
+    console.log("=".repeat(60));
+    console.log(`📞 Phone Number: ${phoneNumber}`);
+    console.log(`🔐 OTP Code: ${otp}`);
+    console.log(`⏰ Expires in: 10 minutes`);
+    console.log(`👤 Role: ${role}`);
+    if (email && !email.includes("@temp.com"))
+      console.log(`📧 Backup Email: ${email}`);
+    console.log("=".repeat(60) + "\n");
 
-        console.log(`Attempting to send SMS to: ${formattedPhone}`);
-
-        await twilioClient.messages.create({
-          body: `Your Sandrealize Salon verification code is: ${otp}. This code will expire in 10 minutes.`,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: formattedPhone,
-        });
-
-        console.log(
-          `[SMS SENT] Phone: ${phoneNumber}, Formatted: ${formattedPhone}, OTP: ${otp}`
-        );
-      } catch (smsError) {
-        console.error("SMS sending failed:", smsError.message);
-        // Continue with the response even if SMS fails
-        console.log(
-          `[OTP DEBUG] Phone: ${phoneNumber}, OTP: ${otp} (SMS failed: ${smsError.message})`
-        );
-      }
-    } else {
-      // Log OTP to console if SMS is not configured
-      console.log(
-        `[OTP DEBUG] Phone: ${phoneNumber}, OTP: ${otp} (SMS not configured)`
-      );
-    }
-
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      message: "OTP sent to your phone number",
-      // Remove OTP from response in production
-      // otp: otp, // Only for development
+      message:
+        "OTP sent to your phone number. Check your terminal for the code.",
+      channel: "sms",
       expiresIn: "10 minutes",
+      otp: otp, // ⚠️ ONLY for development - remove in production
     });
   } catch (error) {
-    console.log("Error sending phone OTP", error);
+    console.error("Error sending phone OTP:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -849,7 +1042,7 @@ router.post("/send-phone-otp", async (req, res) => {
 });
 
 // @route   POST /api/auth/verify-phone-otp
-// @desc    Verify phone OTP and proceed to profile setup
+// @desc    Verify phone OTP
 // @access  Public
 router.post("/verify-phone-otp", async (req, res) => {
   try {
@@ -862,7 +1055,6 @@ router.post("/verify-phone-otp", async (req, res) => {
       });
     }
 
-    // Find user by phone number regardless of verification status
     const user = await User.findOne({ phoneNumber });
 
     if (!user) {
@@ -872,7 +1064,6 @@ router.post("/verify-phone-otp", async (req, res) => {
       });
     }
 
-    // Check if phone is already verified
     if (user.verification.phoneVerified) {
       return res.status(400).json({
         success: false,
@@ -908,9 +1099,7 @@ router.post("/verify-phone-otp", async (req, res) => {
   }
 });
 
-// @route   POST /api/auth/setup-email
-// @desc    Setup email and send verification OTP
-// @access  Public
+// ✅ UPDATED: Setup Email (Uses notificationService for EMAIL)
 router.post("/setup-email", async (req, res) => {
   try {
     const { userId, email, password } = req.body;
@@ -960,60 +1149,46 @@ router.post("/setup-email", async (req, res) => {
 
     user.email = email;
     user.password = password;
-
     const otp = user.generateEmailOTP();
-
-    // Use validateBeforeSave: false to bypass password length validation
     await user.save({ validateBeforeSave: false });
 
-    // Send email via Nodemailer if configured
-    if (emailTransporter && process.env.EMAIL_FROM) {
-      try {
-        const mailOptions = {
-          from: `"Sandrealize Salon" <${process.env.EMAIL_FROM}>`,
-          to: email,
-          subject: "Verify Your Email - Sandrealize Salon",
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2 style="color: #4A90E2;">Email Verification</h2>
-              <p>Hello ${user.username},</p>
-              <p>Your verification code is:</p>
-              <div style="background: #f4f4f4; padding: 20px; text-align: center; font-size: 24px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
-                ${otp}
-              </div>
-              <p>This code will expire in 10 minutes.</p>
-              <p>If you didn't request this code, please ignore this email.</p>
-              <br>
-              <p>Best regards,<br>Sandrealize Salon Team</p>
-            </div>
-          `,
-        };
-
-        await emailTransporter.sendMail(mailOptions);
-        console.log(`[EMAIL SENT] Email: ${email}, OTP: ${otp}`);
-      } catch (emailError) {
-        console.error("Email sending failed:", emailError.message);
-        // Continue with the response even if email fails
-        console.log(
-          `[OTP DEBUG] Email: ${email}, OTP: ${otp} (Email failed: ${emailError.message})`
-        );
-      }
-    } else {
-      // Log OTP to console if email is not configured
-      console.log(
-        `[OTP DEBUG] Email: ${email}, OTP: ${otp} (Email not configured)`
+    // ✅ EMAIL: Use notificationService (Gmail/SMTP)
+    try {
+      await notificationService.sendVerificationEmail(
+        email,
+        otp,
+        user.username || user.firstName || "User",
+        "registration"
       );
-    }
 
-    res.status(200).json({
-      success: true,
-      message: "Email setup completed. Verification OTP sent to your email.",
-      // Remove OTP from response in production
-      // otp: otp, // Only for development
-      expiresIn: "10 minutes",
-    });
+      return res.status(200).json({
+        success: true,
+        message: "Email setup completed. Verification code sent to your email.",
+        expiresIn: "10 minutes",
+      });
+    } catch (notificationError) {
+      console.error("Failed to send email:", notificationError);
+
+      // ⚠️ Fallback: Log to terminal if email fails
+      console.log("\n" + "=".repeat(60));
+      console.log("📧 [EMAIL VERIFICATION CODE - TERMINAL FALLBACK]");
+      console.log("=".repeat(60));
+      console.log(`📨 Email: ${email}`);
+      console.log(`🔐 OTP Code: ${otp}`);
+      console.log(`⏰ Expires in: 10 minutes`);
+      console.log(`👤 Username: ${user.username}`);
+      console.log("=".repeat(60) + "\n");
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Verification code generated. Check your terminal (email sending failed).",
+        expiresIn: "10 minutes",
+        otp: otp, // ⚠️ ONLY for development
+      });
+    }
   } catch (error) {
-    console.log("Error setting up email", error);
+    console.error("Error setting up email:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -1022,7 +1197,7 @@ router.post("/setup-email", async (req, res) => {
 });
 
 // @route   POST /api/auth/verify-email-otp
-// @desc    Verify email OTP and complete registration
+// @desc    Verify email OTP
 // @access  Public
 router.post("/verify-email-otp", async (req, res) => {
   try {
@@ -1054,8 +1229,6 @@ router.post("/verify-email-otp", async (req, res) => {
     }
 
     user.registrationStep = "completed";
-
-    // Use validateBeforeSave: false to bypass password length validation
     await user.save({ validateBeforeSave: false });
 
     const token = generateToken(user._id);
@@ -1082,13 +1255,15 @@ router.post("/verify-email-otp", async (req, res) => {
       message: "Internal server error",
     });
   }
-}); // @route   POST /api/auth/change-password
+});
+
+// @route   POST /api/auth/change-password
 // @desc    Change user password
 // @access  Private
 router.post("/change-password", authenticateToken, async (req, res) => {
   try {
     const { currentPassword, newPassword, userId } = req.body;
-    const authUserId = req.user._id || userId; // Use from req.user
+    const authUserId = req.user._id || userId;
 
     if (!authUserId) {
       return res.status(401).json({
@@ -1146,9 +1321,10 @@ router.post("/change-password", authenticateToken, async (req, res) => {
 
     user.password = newPassword;
     user.security.requirePasswordChange = false;
-
-    // Use validateBeforeSave: false to bypass password length validation
     await user.save({ validateBeforeSave: false });
+
+    // Track password change activity
+    await notificationService.trackUserActivity(user._id, "password_changed");
 
     res.status(200).json({
       success: true,
@@ -1168,13 +1344,10 @@ router.post("/change-password", authenticateToken, async (req, res) => {
   }
 });
 
-// @route   POST /api/auth/forgot-password
-// @desc    Request password reset token
-// @access  Public
-router.post("/forgot-password", async (req, res) => {
+// ✅ UPDATED: Forgot Password (SMS Terminal + Email via notificationService)
+router.post("/forgot-password", otpLimiter, async (req, res) => {
   try {
     const { email, phoneNumber, emailOrPhone } = req.body;
-
     const identifier = emailOrPhone || email || phoneNumber;
 
     if (!identifier) {
@@ -1186,14 +1359,12 @@ router.post("/forgot-password", async (req, res) => {
 
     const isEmail = identifier.includes("@");
     const query = isEmail ? { email: identifier } : { phoneNumber: identifier };
-
     const user = await User.findOne(query);
 
     if (!user) {
       return res.status(200).json({
         success: true,
-        message:
-          "If an account with that email/phone exists, a password reset token has been generated.",
+        message: "If an account exists, a password reset code has been sent.",
       });
     }
 
@@ -1214,16 +1385,66 @@ router.post("/forgot-password", async (req, res) => {
     const resetToken = user.generatePasswordResetToken();
     await user.save({ validateBeforeSave: false });
 
-    res.status(200).json({
-      success: true,
-      message: "Password reset token generated successfully.",
-      resetToken: resetToken,
-      expiresIn: "10 minutes",
-      instructions:
-        "Use this token with the reset-password endpoint to set a new password.",
-    });
+    if (isEmail) {
+      // ✅ EMAIL: Use notificationService
+      try {
+        await notificationService.sendPasswordReset(
+          identifier,
+          resetToken,
+          user.username || "User"
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: "Password reset code has been sent to your email.",
+          expiresIn: "10 minutes",
+        });
+      } catch (notificationError) {
+        console.error(
+          "Failed to send password reset email:",
+          notificationError
+        );
+
+        // Fallback: Log to terminal
+        console.log("\n" + "=".repeat(60));
+        console.log("🔐 [PASSWORD RESET TOKEN - TERMINAL FALLBACK]");
+        console.log("=".repeat(60));
+        console.log(`📧 Email: ${identifier}`);
+        console.log(`🎫 Reset Token: ${resetToken}`);
+        console.log(`⏰ Expires in: 10 minutes`);
+        console.log(`👤 Username: ${user.username}`);
+        console.log("=".repeat(60) + "\n");
+
+        return res.status(200).json({
+          success: true,
+          message:
+            "Password reset code generated. Check your terminal (email failed).",
+          expiresIn: "10 minutes",
+          resetToken: resetToken, // ⚠️ ONLY for development
+        });
+      }
+    } else {
+      // ✅ SMS: ONLY LOG TO TERMINAL
+      console.log("\n" + "=".repeat(60));
+      console.log("🔐 [PASSWORD RESET TOKEN - TERMINAL ONLY]");
+      console.log("=".repeat(60));
+      console.log(`📱 Phone: ${identifier}`);
+      console.log(`🎫 Reset Token: ${resetToken}`);
+      console.log(`⏰ Expires in: 10 minutes`);
+      console.log(`👤 Username: ${user.username}`);
+      console.log("=".repeat(60) + "\n");
+
+      return res.status(200).json({
+        success: true,
+        message:
+          "Password reset code generated. Check your terminal for the code.",
+        channel: "sms",
+        expiresIn: "10 minutes",
+        resetToken: resetToken, // ⚠️ ONLY for development
+      });
+    }
   } catch (error) {
-    console.log("Error in forgot password route", error);
+    console.error("Error in forgot password:", error);
     res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -1231,89 +1452,14 @@ router.post("/forgot-password", async (req, res) => {
   }
 });
 
-// @route   POST /api/auth/reset-password
-// @desc    Reset password using token
-// @access  Public
-router.post("/reset-password", async (req, res) => {
-  try {
-    const { token, newPassword, email, phoneNumber, emailOrPhone } = req.body;
-
-    if (!token || !newPassword) {
-      return res.status(400).json({
-        success: false,
-        message: "Reset token and new password are required",
-      });
-    }
-
-    const identifier = emailOrPhone || email || phoneNumber;
-    if (!identifier) {
-      return res.status(400).json({
-        success: false,
-        message: "Email or phone number is required",
-      });
-    }
-
-    const passwordStrengthCheck = User.validatePasswordStrength(newPassword);
-    if (!passwordStrengthCheck.isValid) {
-      return res.status(400).json({
-        success: false,
-        message: passwordStrengthCheck.message,
-        passwordStrength: passwordStrengthCheck,
-      });
-    }
-
-    const isEmail = identifier.includes("@");
-    const query = isEmail ? { email: identifier } : { phoneNumber: identifier };
-
-    const user = await User.findOne(query);
-
-    if (!user) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid reset token or user not found",
-      });
-    }
-
-    if (!user.verifyPasswordResetToken(token)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid or expired reset token",
-      });
-    }
-
-    user.password = newPassword;
-    user.clearPasswordResetToken();
-
-    user.security.failedLoginAttempts = 0;
-    user.security.nextAllowedLogin = undefined;
-    user.security.delaySeconds = 0;
-    user.security.requirePasswordChange = false;
-
-    // Use validateBeforeSave: false to bypass password length validation
-    await user.save({ validateBeforeSave: false });
-
-    res.status(200).json({
-      success: true,
-      message: `Password reset successfully! New password strength: ${passwordStrengthCheck.strength}`,
-      passwordStrength: {
-        strength: passwordStrengthCheck.strength,
-        color: passwordStrengthCheck.color,
-        score: passwordStrengthCheck.score,
-      },
-    });
-  } catch (error) {
-    console.log("Error in reset password route", error);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
-  }
-}); // @route   POST /api/auth/login
-// @desc    User login with role-based authentication options
+// @route   POST /api/auth/login
+// @desc    User login with FIXED progressive delay system
 // @access  Public
 router.post("/login", async (req, res) => {
   try {
     const { email, phoneNumber, password, emailOrPhone, role } = req.body;
+
+    console.log("🔑 Login attempt:", { emailOrPhone, role });
 
     const loginIdentifier = emailOrPhone || email || phoneNumber;
 
@@ -1331,30 +1477,31 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    if (password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: "Password should be at least 8 characters long.",
-      });
-    }
-
+    // Find user
     const isEmail = loginIdentifier.includes("@");
-    const query = {
-      ...(isEmail
-        ? { email: loginIdentifier }
-        : { phoneNumber: loginIdentifier }),
+    let query = {
       role: role,
       registrationStep: "completed",
+      $or: [],
     };
+
+    if (isEmail) {
+      query.$or.push({ email: loginIdentifier });
+    } else {
+      query.$or.push({ phoneNumber: loginIdentifier });
+    }
 
     const user = await User.findOne(query);
 
     if (!user) {
+      console.log("❌ User not found with query:", query);
       return res.status(400).json({
         success: false,
         message: "Invalid credentials or user not found with this role",
       });
     }
+
+    console.log("✅ User found:", user._id, user.username);
 
     if (user.isGuest) {
       return res.status(400).json({
@@ -1364,48 +1511,76 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    if (user.isAccountLocked()) {
-      const remainingTime = user.getRemainingDelayTime();
-      const shouldRecommendForgot = user.shouldRecommendForgotPassword();
-
+    // Check if account is locked with active delay
+    const now = new Date();
+    if (
+      user.security.nextAllowedLogin &&
+      user.security.nextAllowedLogin > now
+    ) {
+      const remainingTime = Math.ceil(
+        (user.security.nextAllowedLogin - now) / 1000
+      );
       return res.status(429).json({
         success: false,
         message: `Too many failed attempts. Please wait ${remainingTime} seconds before trying again.`,
         delayActive: true,
         remainingTime,
         failedAttempts: user.security.failedLoginAttempts,
-        recommendForgotPassword: shouldRecommendForgot,
-        forgotPasswordMessage: shouldRecommendForgot
-          ? "Consider using 'Forgot Password' if you can't remember your password."
-          : null,
       });
     }
 
+    // Password verification
     const isPasswordCorrect = await user.comparePassword(password);
+    console.log("🔐 Password check result:", isPasswordCorrect);
+
     if (!isPasswordCorrect) {
-      await user.handleFailedLogin();
+      // Handle failed login with progressive delays
+      const { delaySeconds, shouldShowDelay } =
+        await handleFailedLoginWithProgressiveDelay(user);
 
-      const shouldRecommendForgot = user.shouldRecommendForgotPassword();
-      const delaySeconds = user.security.delaySeconds;
+      const failedAttempts = user.security.failedLoginAttempts || 1;
 
-      return res.status(400).json({
-        success: false,
-        message: `Invalid credentials. Please wait ${delaySeconds} seconds before trying again.`,
-        failedAttempts: user.security.failedLoginAttempts,
-        delaySeconds,
-        recommendForgotPassword: shouldRecommendForgot,
-        forgotPasswordMessage: shouldRecommendForgot
-          ? "Multiple failed attempts detected. Consider using 'Forgot Password' to reset your password."
-          : null,
-      });
+      // Return appropriate response based on attempt number
+      if (shouldShowDelay) {
+        return res.status(429).json({
+          success: false,
+          message: `Too many failed attempts. Please wait ${delaySeconds} seconds before trying again.`,
+          failedAttempts,
+          delaySeconds,
+          delayActive: true,
+        });
+      } else {
+        // For attempts without delay, just show invalid credentials
+        return res.status(400).json({
+          success: false,
+          message: "Invalid credentials. Try Again.",
+          failedAttempts,
+          delaySeconds: 0,
+          delayActive: false,
+        });
+      }
     }
 
-    await user.handleSuccessfulLogin();
+    // ✅ SUCCESSFUL LOGIN - Reset all security fields
+    user.security.failedLoginAttempts = 0;
+    user.security.lastFailedLogin = undefined;
+    user.security.nextAllowedLogin = undefined;
+    user.security.delaySeconds = 0;
+    user.lastLogin = new Date();
 
-    const passwordStrengthCheck = user.passwordStrength;
-    const requiresPasswordUpdate = passwordStrengthCheck.strength === "weak";
+    // Update activity for admin/staff users
+    if (user.role === "admin" || user.role === "salon_staff") {
+      user.lastActivity = new Date();
+    }
+
+    await user.save({ validateBeforeSave: false });
+
+    // Track login activity
+    await notificationService.trackUserActivity(user._id, "user_logged_in");
 
     const token = generateToken(user._id);
+
+    console.log("✅ Login successful for user:", user.username);
 
     res.status(200).json({
       success: true,
@@ -1421,17 +1596,14 @@ router.post("/login", async (req, res) => {
         isGuest: user.isGuest || false,
         createdAt: user.createdAt,
       },
-      security: {
-        passwordStrength: passwordStrengthCheck,
-        requiresPasswordUpdate,
-        lastPasswordChange: user.security.passwordChangedAt,
-      },
+      redirectTo:
+        role === "salon_staff" ? "/staff/dashboard" : "/customer/dashboard",
     });
   } catch (error) {
-    console.log("Error in login route", error);
+    console.error("❌ Error in login route:", error);
     res.status(500).json({
       success: false,
-      message: "Internal server error",
+      message: "Internal server error - " + error.message,
     });
   }
 });
@@ -1494,9 +1666,20 @@ router.post("/auth/google", async (req, res) => {
         },
       });
 
-      // Use validateBeforeSave: false to bypass password length validation
       await user.save({ validateBeforeSave: false });
+
+      // Track registration activity for Google signup
+      await notificationService.trackUserActivity(user._id, "user_registered", {
+        username: user.username,
+        email: user.email,
+        authProvider: "google",
+      });
     }
+
+    // Track login activity
+    await notificationService.trackUserActivity(user._id, "user_logged_in", {
+      authProvider: "google",
+    });
 
     const token = generateToken(user._id);
 
@@ -1515,6 +1698,7 @@ router.post("/auth/google", async (req, res) => {
         createdAt: user.createdAt,
       },
       authProvider: "google",
+      redirectTo: "/customer/dashboard", // ✅ Added for customers
     });
   } catch (error) {
     console.log("Error in Google auth route", error);
@@ -1585,9 +1769,20 @@ router.post("/auth/facebook", async (req, res) => {
         },
       });
 
-      // Use validateBeforeSave: false to bypass password length validation
       await user.save({ validateBeforeSave: false });
+
+      // Track registration activity for Facebook signup
+      await notificationService.trackUserActivity(user._id, "user_registered", {
+        username: user.username,
+        email: user.email,
+        authProvider: "facebook",
+      });
     }
+
+    // Track login activity
+    await notificationService.trackUserActivity(user._id, "user_logged_in", {
+      authProvider: "facebook",
+    });
 
     const token = generateToken(user._id);
 
@@ -1606,6 +1801,7 @@ router.post("/auth/facebook", async (req, res) => {
         createdAt: user.createdAt,
       },
       authProvider: "facebook",
+      redirectTo: "/customer/dashboard", // ✅ Added for customers
     });
   } catch (error) {
     console.log("Error in Facebook auth route", error);
@@ -1614,204 +1810,216 @@ router.post("/auth/facebook", async (req, res) => {
       message: "Internal server error",
     });
   }
+});
 
-  // @route   POST /api/auth/admin-login
-  // @desc    Admin/staff login
-  // @access  Public
-  router.post("/admin-login", async (req, res) => {
-    try {
-      const { email, phoneNumber, password, emailOrPhone } = req.body;
+// @route   POST /api/auth/admin-login
+// @desc    Admin/staff login
+// @access  Public
+router.post("/admin-login", async (req, res) => {
+  try {
+    const { email, phoneNumber, password, emailOrPhone } = req.body;
 
-      const loginIdentifier = emailOrPhone || email || phoneNumber;
+    const loginIdentifier = emailOrPhone || email || phoneNumber;
 
-      if (!loginIdentifier || !password) {
-        return res.status(400).json({
-          success: false,
-          message: "Email/Phone number and password are required",
-        });
-      }
-
-      if (password.length < 8) {
-        return res.status(400).json({
-          success: false,
-          message: "Password should be at least 8 characters long.",
-        });
-      }
-
-      const isEmail = loginIdentifier.includes("@");
-      const query = {
-        ...(isEmail
-          ? { email: loginIdentifier }
-          : { phoneNumber: loginIdentifier }),
-        role: "salon_staff", // Only salon_staff can login as admin
-        registrationStep: "completed",
-        isActive: true,
-      };
-
-      const user = await User.findOne(query);
-
-      if (!user) {
-        return res.status(401).json({
-          success: false,
-          message: "Invalid credentials or insufficient permissions",
-        });
-      }
-
-      if (user.isGuest) {
-        return res.status(401).json({
-          success: false,
-          message: "Guest accounts cannot access admin dashboard",
-        });
-      }
-
-      if (user.isAccountLocked && user.isAccountLocked()) {
-        const remainingTime = user.getRemainingDelayTime
-          ? user.getRemainingDelayTime()
-          : 60;
-        return res.status(429).json({
-          success: false,
-          message: `Too many failed attempts. Please wait ${remainingTime} seconds before trying again.`,
-          delayActive: true,
-          remainingTime,
-        });
-      }
-
-      const isPasswordCorrect = await user.comparePassword(password);
-      if (!isPasswordCorrect) {
-        if (user.handleFailedLogin) {
-          await user.handleFailedLogin();
-        }
-        return res.status(401).json({
-          success: false,
-          message: "Invalid credentials",
-        });
-      }
-
-      if (user.handleSuccessfulLogin) {
-        await user.handleSuccessfulLogin();
-      }
-
-      const token = generateToken(user._id);
-
-      res.status(200).json({
-        success: true,
-        message: "Admin login successful!",
-        token,
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          phoneNumber: user.phoneNumber,
-          profileImage: user.profileImage,
-          role: user.role,
-          position: user.position,
-          staffId: user.staffId,
-          isGuest: user.isGuest || false,
-          createdAt: user.createdAt,
-        },
-      });
-    } catch (error) {
-      console.log("Error in admin login route", error);
-      res.status(500).json({
+    if (!loginIdentifier || !password) {
+      return res.status(400).json({
         success: false,
-        message: "Internal server error",
+        message: "Email/Phone number and password are required",
       });
     }
-  });
 
-  // @route   GET /api/auth/verify-admin
-  // @desc    Verify admin token and get admin profile
-  // @access  Private (Admin only)
-  router.get("/verify-admin", authenticateToken, async (req, res) => {
-    try {
-      const user = req.user;
-
-      // Check if user is salon staff
-      if (user.role !== "salon_staff") {
-        return res.status(403).json({
-          success: false,
-          message: "Access denied. Admin privileges required.",
-        });
-      }
-
-      res.status(200).json({
-        success: true,
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          phoneNumber: user.phoneNumber,
-          profileImage: user.profileImage,
-          role: user.role,
-          position: user.position,
-          staffId: user.staffId,
-          isActive: user.isActive,
-          hireDate: user.hireDate,
-          createdAt: user.createdAt,
-        },
-      });
-    } catch (error) {
-      console.log("Error verifying admin token", error);
-      res.status(500).json({
+    if (password.length < 8) {
+      return res.status(400).json({
         success: false,
-        message: "Internal server error",
+        message: "Password should be at least 8 characters long.",
       });
     }
-  });
 
-  // ✅ Register Admin Route
-  router.post("/register-admin", async (req, res) => {
-    try {
-      const { username, email, phoneNumber, password } = req.body;
+    const isEmail = loginIdentifier.includes("@");
+    const query = {
+      ...(isEmail
+        ? { email: loginIdentifier }
+        : { phoneNumber: loginIdentifier }),
+      role: "salon_staff",
+      registrationStep: "completed",
+      isActive: true,
+    };
 
-      // Check existing
-      const existingUser = await User.findOne({
-        $or: [{ email }, { username }, { phoneNumber }],
+    const user = await User.findOne(query);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid credentials or insufficient permissions",
       });
-      if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          message: "Email, username or phone number already registered",
-        });
+    }
+
+    if (user.isGuest) {
+      return res.status(401).json({
+        success: false,
+        message: "Guest accounts cannot access admin dashboard",
+      });
+    }
+
+    if (user.isAccountLocked && user.isAccountLocked()) {
+      const remainingTime = user.getRemainingDelayTime
+        ? user.getRemainingDelayTime()
+        : 60;
+      return res.status(429).json({
+        success: false,
+        message: `Too many failed attempts. Please wait ${remainingTime} seconds before trying again.`,
+        delayActive: true,
+        remainingTime,
+      });
+    }
+
+    const isPasswordCorrect = await user.comparePassword(password);
+    if (!isPasswordCorrect) {
+      if (user.handleFailedLogin) {
+        await user.handleFailedLogin();
       }
+      return res.status(401).json({
+        success: false,
+        message: "Invalid credentials",
+      });
+    }
 
-      // Hash password
-      const hashedPassword = await bcrypt.hash(password, 12);
+    if (user.handleSuccessfulLogin) {
+      await user.handleSuccessfulLogin();
+    }
 
-      // Generate DiceBear avatar
-      const avatarUrl = `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
+    // Track login activity
+    await notificationService.trackUserActivity(user._id, "user_logged_in", {
+      role: "staff",
+    });
 
-      // Create admin user
-      const newAdmin = new User({
-        username,
-        email,
-        phoneNumber,
-        password: hashedPassword,
+    const token = generateToken(user._id);
+
+    res.status(200).json({
+      success: true,
+      message: "Admin login successful!",
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        profileImage: user.profileImage,
+        role: user.role,
+        position: user.position,
+        staffId: user.staffId,
+        isGuest: user.isGuest || false,
+        createdAt: user.createdAt,
+      },
+      redirectTo: "/staff/dashboard", // ✅ Added for staff
+    });
+  } catch (error) {
+    console.log("Error in admin login route", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+});
+
+// @route   GET /api/auth/verify-admin
+// @desc    Verify admin token
+// @access  Private (Admin only)
+router.get("/verify-admin", authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+
+    if (user.role !== "salon_staff") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Admin privileges required.",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        profileImage: user.profileImage,
+        role: user.role,
+        position: user.position,
+        staffId: user.staffId,
+        isActive: user.isActive,
+        hireDate: user.hireDate,
+        createdAt: user.createdAt,
+      },
+    });
+  } catch (error) {
+    console.log("Error verifying admin token", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+});
+
+// @route   POST /api/auth/register-admin
+// @desc    Register admin
+// @access  Public (should be protected in production)
+router.post("/register-admin", async (req, res) => {
+  try {
+    const { username, email, phoneNumber, password } = req.body;
+
+    const existingUser = await User.findOne({
+      $or: [{ email }, { username }, { phoneNumber }],
+    });
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: "Email, username or phone number already registered",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    const avatarUrl = `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
+
+    const newAdmin = new User({
+      username,
+      email,
+      phoneNumber,
+      password: hashedPassword,
+      role: "admin",
+      profileImage: avatarUrl,
+      verification: { phoneVerified: true, emailVerified: true },
+    });
+
+    await newAdmin.save();
+
+    // Track admin registration activity
+    await notificationService.trackUserActivity(
+      newAdmin._id,
+      "user_registered",
+      {
+        username: newAdmin.username,
+        email: newAdmin.email,
         role: "admin",
-        profileImage: avatarUrl,
-        verification: { phoneVerified: true, emailVerified: true }, // optional
-      });
+      }
+    );
 
-      await newAdmin.save();
-
-      res.status(201).json({
-        success: true,
-        message: "Admin account created successfully",
-        admin: {
-          id: newAdmin._id,
-          username: newAdmin.username,
-          email: newAdmin.email,
-          role: newAdmin.role,
-          profileImage: newAdmin.profileImage,
-        },
-      });
-    } catch (error) {
-      console.error("Register Admin Error:", error);
-      res
-        .status(500)
-        .json({ success: false, message: "Internal server error" });
-    }
-  });
+    res.status(201).json({
+      success: true,
+      message: "Admin account created successfully",
+      admin: {
+        id: newAdmin._id,
+        username: newAdmin.username,
+        email: newAdmin.email,
+        role: newAdmin.role,
+        profileImage: newAdmin.profileImage,
+      },
+    });
+  } catch (error) {
+    console.error("Register Admin Error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
 });
 
 export default router;

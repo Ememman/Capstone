@@ -1,3 +1,4 @@
+// models/Attendance.js - COMPLETE UPDATED WITH BREAK FUNCTIONALITY
 import mongoose from "mongoose";
 
 const attendanceSchema = new mongoose.Schema({
@@ -18,6 +19,45 @@ const attendanceSchema = new mongoose.Schema({
   clockOutTime: {
     type: Date,
     default: null,
+  },
+  // ADD BREAK FIELDS
+  breaks: [
+    {
+      breakStart: {
+        type: Date,
+        default: null,
+      },
+      breakEnd: {
+        type: Date,
+        default: null,
+      },
+      breakDuration: {
+        type: Number, // in minutes
+        default: 0,
+      },
+      breakType: {
+        type: String,
+        enum: ["lunch", "short", "personal", "other"],
+        default: "lunch",
+      },
+      breakLocation: {
+        latitude: Number,
+        longitude: Number,
+        address: String,
+      },
+      isValidLocation: {
+        type: Boolean,
+        default: false,
+      },
+    },
+  ],
+  totalBreakTime: {
+    type: Number, // total break minutes for the day
+    default: 0,
+  },
+  netWorkingHours: {
+    type: Number, // working hours minus break time
+    default: 0,
   },
   clockInLocation: {
     latitude: {
@@ -51,7 +91,7 @@ const attendanceSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ["present", "absent", "late", "half-day"],
+    enum: ["present", "absent", "late", "half-day", "on-break"],
     default: "absent",
   },
   workingHours: {
@@ -94,28 +134,35 @@ attendanceSchema.index({ date: 1 });
 attendanceSchema.methods.calculateWorkingHours = function () {
   if (this.clockInTime && this.clockOutTime) {
     const diffMs = this.clockOutTime - this.clockInTime;
-    this.workingHours = Math.floor(diffMs / (1000 * 60)); // Convert to minutes
+    const totalMinutes = Math.floor(diffMs / (1000 * 60));
+
+    // Subtract break time
+    this.workingHours = Math.max(0, totalMinutes - this.totalBreakTime);
+    this.netWorkingHours = this.workingHours;
   }
   return this.workingHours;
 };
 
-// Check if location is within salon premises (using Haversine formula)
+// Enhanced GPS validation with Haversine formula
 attendanceSchema.statics.isWithinSalonRadius = (
   userLat,
   userLng,
-  salonLat = 14.5995,
+  salonLat = 14.5995, // SandreaLee Salon coordinates
   salonLng = 120.9842,
-  radiusKm = 0.1
+  radiusKm = 5 // 5km radius
 ) => {
   const R = 6371; // Earth's radius in kilometers
+
   const dLat = ((salonLat - userLat) * Math.PI) / 180;
   const dLng = ((salonLng - userLng) * Math.PI) / 180;
+
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
     Math.cos((userLat * Math.PI) / 180) *
       Math.cos((salonLat * Math.PI) / 180) *
       Math.sin(dLng / 2) *
       Math.sin(dLng / 2);
+
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   const distance = R * c;
 
@@ -124,6 +171,57 @@ attendanceSchema.statics.isWithinSalonRadius = (
     distance: distance,
     distanceMeters: Math.round(distance * 1000),
   };
+};
+
+// ADD BREAK METHODS
+attendanceSchema.methods.startBreak = function (
+  breakType = "lunch",
+  location = null
+) {
+  this.breaks.push({
+    breakStart: new Date(),
+    breakType: breakType,
+    breakLocation: location,
+  });
+  this.status = "on-break";
+  return this.save();
+};
+
+attendanceSchema.methods.endBreak = function (location = null) {
+  const activeBreak = this.breaks.find((breakItem) => !breakItem.breakEnd);
+
+  if (activeBreak) {
+    activeBreak.breakEnd = new Date();
+    if (location) {
+      activeBreak.breakLocation = location;
+    }
+
+    // Calculate break duration in minutes
+    const breakDuration = Math.floor(
+      (activeBreak.breakEnd - activeBreak.breakStart) / (1000 * 60)
+    );
+    activeBreak.breakDuration = breakDuration;
+
+    // Update total break time
+    this.totalBreakTime = this.breaks.reduce(
+      (total, breakItem) => total + (breakItem.breakDuration || 0),
+      0
+    );
+
+    // Calculate net working hours
+    if (this.clockInTime) {
+      const currentTime = this.clockOutTime || new Date();
+      const totalMinutes = Math.floor(
+        (currentTime - this.clockInTime) / (1000 * 60)
+      );
+      this.netWorkingHours = Math.max(0, totalMinutes - this.totalBreakTime);
+    }
+
+    this.status = "present";
+    return this.save();
+  }
+
+  return Promise.resolve(this);
 };
 
 // Get monthly attendance summary
@@ -149,6 +247,9 @@ attendanceSchema.statics.getMonthlyAttendance = async function (
     halfDay: 0,
     totalWorkingHours: 0,
     attendancePercentage: 0,
+    averageWorkingHours: 0,
+    totalBreakTime: 0,
+    averageBreakTime: 0,
   };
 
   attendance.forEach((record) => {
@@ -168,13 +269,27 @@ attendanceSchema.statics.getMonthlyAttendance = async function (
         summary.halfDay++;
         summary.present++; // Half day is still present
         break;
+      case "on-break":
+        summary.present++; // On break is still present
+        break;
     }
     summary.totalWorkingHours += record.workingHours || 0;
+    summary.totalBreakTime += record.totalBreakTime || 0;
   });
 
   summary.attendancePercentage =
     summary.workingDays > 0
       ? Math.round((summary.present / summary.workingDays) * 100)
+      : 0;
+
+  summary.averageWorkingHours =
+    summary.present > 0
+      ? Math.round(summary.totalWorkingHours / summary.present)
+      : 0;
+
+  summary.averageBreakTime =
+    summary.present > 0
+      ? Math.round(summary.totalBreakTime / summary.present)
       : 0;
 
   return summary;
