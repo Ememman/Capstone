@@ -28,7 +28,7 @@ const extractToken = (req) => {
 // Helper function to verify JWT token
 const verifyToken = (token) => {
   try {
-    return jwt.verify(token, process.env.JWT_SECRET);
+    return jwt.verify(token, process.env.JWT_SECRET || "sandrea_lee_salon_jwt_super_secret_key_2026");
   } catch (error) {
     if (error.name === "TokenExpiredError") {
       throw new Error("Token expired");
