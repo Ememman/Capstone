@@ -5,13 +5,13 @@ import {
   optionalAuth,
   authMiddleware,
   customerOnly,
+  staffOnly,
 } from "../middleware/auth.js";
 
 const router = express.Router();
 
 const parsePrice = (priceRange) => {
   if (!priceRange) return 0;
-  // Remove ₱ symbol and commas, then parse the number
   const match = priceRange.match(/[\d,]+/);
   if (match) {
     return Number.parseInt(match[0].replace(/,/g, ""));
@@ -40,17 +40,6 @@ const buildSortObject = (sortBy, sortOrder) => {
     case "promo":
       sortObj = { isPromo: -1, name: 1 };
       break;
-    case "price-low":
-      // Price sorting handled separately due to string parsing
-      sortObj = { _priceSort: 1 };
-      break;
-    case "price-high":
-      sortObj = { _priceSort: -1 };
-      break;
-    case "duration":
-      // Duration sorting handled separately due to string parsing
-      sortObj = { _durationSort: 1 };
-      break;
     case "popularity":
     case "most-booked":
       sortObj = { totalBookings: -1 };
@@ -71,11 +60,9 @@ const buildSortObject = (sortBy, sortOrder) => {
       sortObj = { name: -1 };
       break;
     default:
-      // Default sort by serviceId
       sortObj = { createdAt: -1 };
   }
 
-  // Apply custom sort order if provided
   if (sortOrder === "asc" || sortOrder === "desc") {
     const direction = sortOrder === "asc" ? 1 : -1;
     const keys = Object.keys(sortObj);
@@ -87,24 +74,25 @@ const buildSortObject = (sortBy, sortOrder) => {
   return sortObj;
 };
 
-// GET all services with sorting support
+// GET /api/services - GET all services with sorting and filtering
 router.get("/", optionalAuth, async (req, res) => {
   try {
-    const { sortBy, sortOrder, category, minRating } = req.query;
+    const { sortBy, sortOrder, category, minRating, isPromo } = req.query;
 
     let query = {};
 
-    // Filter by category
     if (category && category !== "all") {
       query.category = { $regex: new RegExp(category, "i") };
     }
 
-    // Filter by minimum rating
     if (minRating) {
       query["rating.average"] = { $gte: parseFloat(minRating) };
     }
 
-    // Fetch all services
+    if (isPromo !== undefined && isPromo !== "") {
+      query.isPromo = isPromo === "true" || isPromo === true;
+    }
+
     let services = await Service.find(query);
 
     if (sortBy === "price-low" || sortBy === "price-high") {
@@ -147,23 +135,103 @@ router.get("/", optionalAuth, async (req, res) => {
   }
 });
 
-// GET services by category with sorting support
+// GET /api/services/search - Full-text search for salon services
+router.get("/search", optionalAuth, async (req, res) => {
+  try {
+    const { q, category, minRating, isPromo, sortBy } = req.query;
+
+    let query = {};
+
+    if (q && q.trim()) {
+      const searchRegex = new RegExp(q.trim(), "i");
+      query.$or = [
+        { name: searchRegex },
+        { description: searchRegex },
+        { category: searchRegex },
+      ];
+    }
+
+    if (category && category !== "all") {
+      query.category = { $regex: new RegExp(category, "i") };
+    }
+
+    if (minRating) {
+      query["rating.average"] = { $gte: parseFloat(minRating) };
+    }
+
+    if (isPromo !== undefined) {
+      query.isPromo = isPromo === "true" || isPromo === true;
+    }
+
+    let services = await Service.find(query);
+
+    if (sortBy === "price-low" || sortBy === "price-high") {
+      services = services.sort((a, b) => {
+        const priceA = parsePrice(a.priceRange);
+        const priceB = parsePrice(b.priceRange);
+        return sortBy === "price-low" ? priceA - priceB : priceB - priceA;
+      });
+    } else if (sortBy === "popularity") {
+      services = services.sort((a, b) => (b.totalBookings || 0) - (a.totalBookings || 0));
+    } else if (sortBy === "rating") {
+      services = services.sort(
+        (a, b) => (b.rating?.average || 0) - (a.rating?.average || 0)
+      );
+    }
+
+    res.json({
+      success: true,
+      query: q || "",
+      total: services.length,
+      data: services,
+    });
+  } catch (error) {
+    console.error("Error searching services:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error searching services",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/categories - GET all categories
+router.get("/categories", optionalAuth, async (req, res) => {
+  try {
+    const categories = await Service.distinct("category");
+    categories.sort();
+
+    res.status(200).json({
+      success: true,
+      message: "Categories retrieved successfully",
+      data: categories,
+      total: categories.length,
+      user: req.user
+        ? {
+            _id: req.user._id,
+            role: req.user.role,
+            isLoggedIn: true,
+          }
+        : { isLoggedIn: false },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving categories",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/category/:category - GET services by category
 router.get("/category/:category", optionalAuth, async (req, res) => {
   try {
     const { category } = req.params;
     const { sortBy, sortOrder } = req.query;
 
-    // Fetch services by category
     let services = await Service.find({
       category: { $regex: new RegExp(category, "i") },
     });
-
-    if (services.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: `No services found for category: ${category}`,
-      });
-    }
 
     if (sortBy === "price-low" || sortBy === "price-high") {
       services = services.sort((a, b) => {
@@ -193,7 +261,7 @@ router.get("/category/:category", optionalAuth, async (req, res) => {
       user: req.user
         ? {
             _id: req.user._id,
-            role: req.user._id,
+            role: req.user.role,
             isLoggedIn: true,
           }
         : { isLoggedIn: false },
@@ -202,133 +270,6 @@ router.get("/category/:category", optionalAuth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error retrieving services by category",
-      error: error.message,
-    });
-  }
-});
-
-// GET all categories (sorted alphabetically)
-router.get("/categories", optionalAuth, async (req, res) => {
-  try {
-    const categories = await Service.distinct("category");
-    categories.sort();
-
-    res.status(200).json({
-      success: true,
-      message: "Categories retrieved successfully",
-      data: categories,
-      total: categories.length,
-      user: req.user
-        ? {
-            _id: req.user._id,
-            role: req.user.role,
-            isLoggedIn: true,
-          }
-        : { isLoggedIn: false },
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error retrieving categories",
-      error: error.message,
-    });
-  }
-});
-
-// GET service by ID
-router.get("/:id", optionalAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const service = await Service.findById(id);
-
-    if (!service) {
-      return res.status(404).json({
-        success: false,
-        message: `Service with ID ${id} not found`,
-      });
-    }
-
-    // Update rating stats in case they're outdated
-    await service.updateRatingStats();
-
-    res.status(200).json({
-      success: true,
-      message: "Service retrieved successfully",
-      data: service,
-      user: req.user
-        ? {
-            _id: req.user._id,
-            role: req.user.role,
-            isLoggedIn: true,
-          }
-        : { isLoggedIn: false },
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error retrieving service",
-      error: error.message,
-    });
-  }
-});
-
-// GET /api/services/:id/ratings - Get service ratings
-router.get("/:id/ratings", optionalAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { page = 1, limit = 10, rating } = req.query;
-
-    const service = await Service.findById(id);
-    if (!service) {
-      return res.status(404).json({
-        success: false,
-        message: "Service not found",
-      });
-    }
-
-    const skip = (page - 1) * limit;
-    const query = {
-      "ratedEntity.type": "service",
-      "ratedEntity.id": id,
-      status: "active",
-    };
-
-    if (rating) {
-      query.rating = parseInt(rating);
-    }
-
-    const ratings = await Rating.find(query)
-      .populate("rater", "username firstName profileImage")
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
-
-    const total = await Rating.countDocuments(query);
-
-    // Update service rating stats
-    await service.updateRatingStats();
-
-    res.json({
-      success: true,
-      data: {
-        service: {
-          _id: service._id,
-          name: service.name,
-          rating: service.rating,
-        },
-        ratings,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit),
-        },
-      },
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Error retrieving service ratings",
       error: error.message,
     });
   }
@@ -372,7 +313,186 @@ router.get("/featured/top-rated", optionalAuth, async (req, res) => {
   }
 });
 
-// POST /api/services/:id/book - Book a service (requires login)
+// GET /api/services/featured/popular - Get most booked / popular services
+router.get("/featured/popular", optionalAuth, async (req, res) => {
+  try {
+    const { limit = 8 } = req.query;
+    const services = await Service.find()
+      .sort({ totalBookings: -1, "rating.average": -1 })
+      .limit(parseInt(limit));
+
+    res.json({
+      success: true,
+      count: services.length,
+      data: services,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving popular services",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/featured/promos - Get special promo packages
+router.get("/featured/promos", optionalAuth, async (req, res) => {
+  try {
+    const promoServices = await Service.find({ isPromo: true })
+      .sort({ "rating.average": -1, createdAt: -1 });
+
+    res.json({
+      success: true,
+      count: promoServices.length,
+      data: promoServices,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving promotional services",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/stats/overview - Service overview stats
+router.get("/stats/overview", optionalAuth, async (req, res) => {
+  try {
+    const totalServices = await Service.countDocuments();
+    const categories = await Service.distinct("category");
+    const promoCount = await Service.countDocuments({ isPromo: true });
+
+    res.json({
+      success: true,
+      data: {
+        totalServices,
+        categoriesCount: categories.length,
+        categories,
+        promoCount,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching service statistics",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/:id - GET service by ID (Must be after specific named routes!)
+router.get("/:id", optionalAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID format",
+      });
+    }
+
+    const service = await Service.findById(id);
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: `Service with ID ${id} not found`,
+      });
+    }
+
+    await service.updateRatingStats();
+
+    res.status(200).json({
+      success: true,
+      message: "Service retrieved successfully",
+      data: service,
+      user: req.user
+        ? {
+            _id: req.user._id,
+            role: req.user.role,
+            isLoggedIn: true,
+          }
+        : { isLoggedIn: false },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving service",
+      error: error.message,
+    });
+  }
+});
+
+// GET /api/services/:id/ratings - Get service ratings
+router.get("/:id/ratings", optionalAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { page = 1, limit = 10, rating } = req.query;
+
+    if (!id.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID format",
+      });
+    }
+
+    const service = await Service.findById(id);
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    const skip = (page - 1) * limit;
+    const query = {
+      "ratedEntity.type": "service",
+      "ratedEntity.id": id,
+      status: "active",
+    };
+
+    if (rating) {
+      query.rating = parseInt(rating);
+    }
+
+    const ratings = await Rating.find(query)
+      .populate("rater", "username firstName profileImage")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Rating.countDocuments(query);
+
+    await service.updateRatingStats();
+
+    res.json({
+      success: true,
+      data: {
+        service: {
+          _id: service._id,
+          name: service.name,
+          rating: service.rating,
+        },
+        ratings,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error retrieving service ratings",
+      error: error.message,
+    });
+  }
+});
+
+// POST /api/services/:id/book - Book a service
 router.post("/:id/book", authMiddleware, customerOnly, async (req, res) => {
   try {
     const { id } = req.params;
@@ -387,6 +507,19 @@ router.post("/:id/book", authMiddleware, customerOnly, async (req, res) => {
 
     service.totalBookings = (service.totalBookings || 0) + 1;
     await service.save();
+
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "service",
+        action: "service-booked",
+        data: {
+          serviceId: service._id,
+          serviceName: service.name,
+          customer: req.user.username,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
 
     res.json({
       success: true,
@@ -410,9 +543,7 @@ router.post("/:id/book", authMiddleware, customerOnly, async (req, res) => {
   }
 });
 
-// @desc    Update service rating stats manually
-// @route   PUT /api/services/:id/update-rating
-// @access  Public
+// PUT /api/services/:id/update-rating - Update service rating stats manually
 router.put("/:id/update-rating", async (req, res) => {
   try {
     const { id } = req.params;
