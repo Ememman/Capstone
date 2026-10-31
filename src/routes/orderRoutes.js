@@ -1,6 +1,7 @@
 import express from "express";
 import Order from "../models/Order.js";
 import Product from "../models/Product.js";
+import Promo from "../models/Promo.js";
 import { authMiddleware, customerOnly, staffOnly } from "../middleware/auth.js";
 import notificationService from "../services/notificationService.js";
 
@@ -417,6 +418,7 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
       contactNumber,
       specialInstructions,
       customerNotes,
+      promoCode,
     } = req.body;
 
     if (!items || items.length === 0) {
@@ -461,13 +463,33 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
     // Calculate shipping fee (simple logic - can be enhanced)
     const shippingFee = deliveryType === "delivery" ? 100 : 0;
 
+    // Apply promo code discount if provided
+    let discount = 0;
+    let appliedPromo = null;
+    if (promoCode && typeof promoCode === "string" && promoCode.trim()) {
+      const cleanCode = promoCode.trim().toUpperCase();
+      const promo = await Promo.findOne({ code: cleanCode });
+      if (promo) {
+        const eligibility = promo.checkEligibility(subtotal, "products");
+        if (eligibility.valid) {
+          discount = promo.calculateDiscount(subtotal);
+          appliedPromo = promo.code;
+          promo.usedCount = (promo.usedCount || 0) + 1;
+          await promo.save();
+        }
+      }
+    }
+
+    const totalAmount = Math.max(0, subtotal + shippingFee - discount);
+
     // Create order
     const order = new Order({
       customer: req.user._id,
       items: orderItems,
       subtotal,
       shippingFee,
-      totalAmount: subtotal + shippingFee,
+      discount,
+      totalAmount,
       deliveryInfo: {
         type: deliveryType || "pickup",
         address: deliveryAddress,
@@ -475,9 +497,31 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
         specialInstructions,
       },
       customerNotes,
+      promoCode,
     });
 
     await order.save();
+
+    // Real-time broadcast to dashboard and customer
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "order",
+        action: "order-created",
+        data: {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          customer: req.user.username || "Customer",
+          totalAmount: order.totalAmount,
+          discount: order.discount,
+          status: order.status,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      req.io.to(`user-${req.user._id}`).emit("order-update", {
+        action: "order-created",
+        order,
+      });
+    }
 
     // Populate the order for response
     await order.populate("items.product", "name price image");
@@ -560,6 +604,27 @@ router.put("/:id/cancel", authMiddleware, async (req, res) => {
 
     await order.save();
 
+    // Real-time broadcast to dashboard and customer
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "order",
+        action: "order-created",
+        data: {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          customer: req.user.username || "Customer",
+          totalAmount: order.totalAmount,
+          discount: order.discount,
+          status: order.status,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      req.io.to(`user-${req.user._id}`).emit("order-update", {
+        action: "order-created",
+        order,
+      });
+    }
+
     // Track order cancellation activity
     await notificationService.trackUserActivity(
       req.user._id,
@@ -616,6 +681,27 @@ router.put("/:id/status", authMiddleware, staffOnly, async (req, res) => {
     }
 
     await order.save();
+
+    // Real-time broadcast to dashboard and customer
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "order",
+        action: "order-created",
+        data: {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          customer: req.user.username || "Customer",
+          totalAmount: order.totalAmount,
+          discount: order.discount,
+          status: order.status,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      req.io.to(`user-${req.user._id}`).emit("order-update", {
+        action: "order-created",
+        order,
+      });
+    }
 
     // Track order status update activity
     await notificationService.trackUserActivity(
@@ -695,6 +781,27 @@ router.put(
         order.deliveryInfo.estimatedDelivery = new Date(estimatedDelivery);
 
       await order.save();
+
+    // Real-time broadcast to dashboard and customer
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "order",
+        action: "order-created",
+        data: {
+          orderId: order._id,
+          orderNumber: order.orderNumber,
+          customer: req.user.username || "Customer",
+          totalAmount: order.totalAmount,
+          discount: order.discount,
+          status: order.status,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      req.io.to(`user-${req.user._id}`).emit("order-update", {
+        action: "order-created",
+        order,
+      });
+    }
 
       res.json({
         success: true,
