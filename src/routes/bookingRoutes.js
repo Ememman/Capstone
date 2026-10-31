@@ -5,6 +5,7 @@ import User from "../models/User.js";
 import { authMiddleware, customerOnly, staffOnly } from "../middleware/auth.js";
 import notificationService from "../services/notificationService.js";
 import mongoose from "mongoose";
+import Promo from "../models/Promo.js";
 
 const router = express.Router();
 
@@ -26,6 +27,7 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
       customerNotes,
       paymentOption = "full", // Add payment option: "full" or "downpayment"
       downpaymentPercentage = 30, // Default 30%
+      promoCode,
     } = req.body;
 
     // Validate required fields
@@ -189,6 +191,22 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
 
     console.log("✅ All validations passed, creating booking...");
 
+    // Calculate promo discount if applicable
+    let discountApplied = 0;
+    if (promoCode && typeof promoCode === "string" && promoCode.trim()) {
+      const cleanCode = promoCode.trim().toUpperCase();
+      const promo = await Promo.findOne({ code: cleanCode });
+      if (promo) {
+        const eligibility = promo.checkEligibility(servicePrice, "services");
+        if (eligibility.valid) {
+          discountApplied = promo.calculateDiscount(servicePrice);
+          promo.usedCount = (promo.usedCount || 0) + 1;
+          await promo.save();
+        }
+      }
+    }
+    const finalBookingTotal = Math.max(0, servicePrice - discountApplied);
+
     // Create booking
     const booking = new Booking({
       customer: req.user._id,
@@ -200,8 +218,8 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
       preferredDate: new Date(preferredDate),
       preferredTime,
       servicePrice,
-      discountApplied: 0,
-      totalAmount: servicePrice,
+      discountApplied,
+      totalAmount: finalBookingTotal,
       paymentOption,
       downpaymentPercentage:
         paymentOption === "downpayment" ? downpaymentPercentage : 0,
@@ -254,6 +272,29 @@ router.post("/create", authMiddleware, customerOnly, async (req, res) => {
         stylistPreference: stylistPreference,
       }
     );
+
+    // Real-time broadcast to dashboard and customer
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "booking",
+        action: "booking-created",
+        data: {
+          bookingId: booking._id,
+          customer: req.user.username || "Customer",
+          serviceName: service.name,
+          preferredDate: booking.preferredDate,
+          preferredTime: booking.preferredTime,
+          totalAmount: booking.totalAmount,
+          discount: booking.discountApplied,
+          status: booking.status,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      req.io.to(`user-${req.user._id}`).emit("booking-update", {
+        action: "booking-created",
+        booking,
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -1107,6 +1148,118 @@ router.get("/staff/all", authMiddleware, staffOnly, async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch bookings",
+      error: error.message,
+    });
+  }
+});
+
+// PUT /api/bookings/:id/reschedule - Reschedule an appointment
+router.put("/:id/reschedule", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { preferredDate, preferredTime, reason } = req.body;
+
+    if (!preferredDate || !preferredTime) {
+      return res.status(400).json({
+        success: false,
+        message: "New preferredDate and preferredTime are required",
+      });
+    }
+
+    const booking = await Booking.findById(id).populate("service").populate("selectedStylist", "username");
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found",
+      });
+    }
+
+    // Verify ownership or staff role
+    if (
+      req.user.role === "customer" &&
+      booking.customer.toString() !== req.user._id.toString()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. You can only reschedule your own bookings",
+      });
+    }
+
+    const newDate = new Date(preferredDate);
+    if (isNaN(newDate.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid date format",
+      });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    newDate.setHours(0, 0, 0, 0);
+    if (newDate < today) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot reschedule to a past date",
+      });
+    }
+
+    const oldDate = booking.preferredDate;
+    const oldTime = booking.preferredTime;
+
+    booking.preferredDate = new Date(preferredDate);
+    booking.preferredTime = preferredTime;
+    if (reason) {
+      booking.customerNotes = booking.customerNotes
+        ? `${booking.customerNotes} | Rescheduled: ${reason}`
+        : `Rescheduled: ${reason}`;
+    }
+
+    await booking.save();
+
+    // Track user notification
+    await notificationService.trackUserActivity(
+      booking.customer,
+      "booking_created",
+      {
+        bookingId: booking._id,
+        serviceName: booking.service?.name || "Service",
+        preferredDate: booking.preferredDate,
+        preferredTime: booking.preferredTime,
+        message: `Appointment rescheduled to ${preferredDate} at ${preferredTime}`,
+      }
+    );
+
+    // Real-time broadcast
+    if (req.io) {
+      req.io.to("admin-dashboard").emit("dashboard-update", {
+        type: "booking",
+        action: "booking-rescheduled",
+        data: {
+          bookingId: booking._id,
+          oldDate,
+          oldTime,
+          newDate: booking.preferredDate,
+          newTime: booking.preferredTime,
+          customer: req.user.username,
+        },
+        timestamp: new Date().toISOString(),
+      });
+      req.io.to(`user-${booking.customer}`).emit("booking-update", {
+        action: "rescheduled",
+        booking,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Booking rescheduled successfully",
+      data: booking,
+    });
+  } catch (error) {
+    console.error("❌ Error rescheduling booking:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error rescheduling booking",
       error: error.message,
     });
   }
