@@ -120,6 +120,18 @@ class NotificationService {
         notificationData
       );
       console.log(`✅ Activity tracked: ${activityType} for user ${userId}`);
+
+      // Real-time WebSocket emission to web and mobile clients
+      if (typeof global !== "undefined" && global.io) {
+        global.io.to(`user-${userId}`).emit("new_notification", notification);
+        global.io.to(`customer-${userId}`).emit("new_notification", notification);
+        global.io.to("admin-dashboard").emit("dashboard-update", {
+          type: "notification",
+          action: activityType,
+          data: notification,
+          timestamp: new Date().toISOString(),
+        });
+      }
       return notification;
     } catch (error) {
       console.error("❌ Error tracking user activity:", error);
