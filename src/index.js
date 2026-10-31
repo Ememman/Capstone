@@ -20,6 +20,7 @@ import notificationRoutes from "./routes/notificationRoutes.js";
 import ratingRoutes from "./routes/ratingRoutes.js";
 import stylistsRoutes from "./routes/stylistsRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import promoRoutes from "./routes/promoRoutes.js";
 import { connectDB } from "./lib/db.js";
 import fs from "fs";
 import path from "path";
@@ -34,20 +35,28 @@ if (!fs.existsSync(uploadsDir)) {
 const app = express();
 const httpServer = createServer(app);
 
-// ✅ MULTI-CLIENT CORS CONFIGURATION
+// ✅ MULTI-CLIENT CORS CONFIGURATION (Admin Dashboard, Website, Mobile App)
 const allowedOrigins = [
   process.env.ADMIN_CLIENT_URL || "http://localhost:5173", // Admin Dashboard
   process.env.WEB_CLIENT_URL || "http://localhost:5174", // Web Client
   "http://localhost:5173",
   "http://localhost:5174",
+  "http://localhost:5175",
+  "http://localhost:8081",
+  "http://localhost:19006",
 ];
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, Postman, etc.)
+    // Allow requests with no origin (like React Native mobile apps, Postman, etc.)
     if (!origin) return callback(null, true);
 
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    if (
+      allowedOrigins.indexOf(origin) !== -1 ||
+      /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+      /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin) ||
+      origin.includes("onrender.com")
+    ) {
       callback(null, true);
     } else {
       console.log(`🚫 CORS blocked for origin: ${origin}`);
@@ -60,10 +69,13 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// Initialize Socket.IO with Multi-Client CORS
+// Initialize Socket.IO with Multi-Client & Mobile Support
 const io = new Server(httpServer, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      // Allow browser clients, Expo web, and mobile app websockets
+      callback(null, true);
+    },
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
   },
@@ -71,6 +83,10 @@ const io = new Server(httpServer, {
   pingTimeout: 60000,
   pingInterval: 25000,
 });
+
+// Expose globally for service layer real-time events
+global.io = io;
+
 const PORT = process.env.PORT || 3000;
 
 // Middleware
@@ -83,26 +99,34 @@ app.use((req, res, next) => {
   // Add origin detection for logging
   const origin = req.get("origin") || req.get("referer");
   req.clientOrigin = origin;
-  // Log client type based on origin
+  // Log client type based on origin or header
   if (origin && origin.includes("5173")) {
     req.clientType = "admin-dashboard";
   } else if (origin && origin.includes("5174")) {
     req.clientType = "web-client";
+  } else if (req.get("x-client-platform") === "mobile" || !origin) {
+    req.clientType = "mobile-app";
+  } else {
+    req.clientType = "unknown";
   }
   next();
 });
+
 // Socket.IO connection handling with client type detection
 io.on("connection", (socket) => {
   console.log(`\n✅ Client connected: ${socket.id}`);
   // Detect client type from handshake
   const clientOrigin =
     socket.handshake.headers.origin || socket.handshake.headers.referer;
-  let clientType = "unknown";
+  const handshakeType = socket.handshake.query?.clientType;
+  let clientType = handshakeType || "unknown";
 
   if (clientOrigin && clientOrigin.includes("5173")) {
     clientType = "admin-dashboard";
   } else if (clientOrigin && clientOrigin.includes("5174")) {
     clientType = "web-client";
+  } else if (handshakeType === "mobile-app" || !clientOrigin) {
+    clientType = "mobile-app";
   }
   socket.clientType = clientType;
   console.log(`   Client Type: ${clientType}`);
@@ -118,14 +142,11 @@ io.on("connection", (socket) => {
     socket.clientType = "admin-dashboard";
 
     console.log(`👤 Admin ${adminId} (${role}) joined dashboard room`);
-    console.log(`   Socket ID: ${socket.id}`);
-    console.log(`   Client Type: ${socket.clientType}`);
-
     const clientsInRoom = io.sockets.adapter.rooms.get("admin-dashboard");
     console.log(
       `   👥 Total admins in dashboard room: ${
         clientsInRoom ? clientsInRoom.size : 0
-      }`,
+      }`
     );
     // Send initial connection confirmation
     socket.emit("connected", {
@@ -134,20 +155,6 @@ io.on("connection", (socket) => {
       clientType: socket.clientType,
       timestamp: new Date().toISOString(),
     });
-
-    // Send a test update to confirm connection
-    setTimeout(() => {
-      socket.emit("dashboard-update", {
-        type: "system",
-        action: "connection-confirmed",
-        data: {
-          message: "Real-time updates are active",
-          socketId: socket.id,
-          clientType: socket.clientType,
-        },
-        timestamp: new Date().toISOString(),
-      });
-    }, 1000);
   });
 
   // Handle web client connections (5174)
@@ -159,12 +166,12 @@ io.on("connection", (socket) => {
     socket.clientType = "web-client";
 
     console.log(`🌐 Web Client User ${userId} (${userType}) joined`);
-    console.log(`   Socket ID: ${socket.id}`);
-    console.log(`   Client Type: ${socket.clientType}`);
 
-    // Join user-specific room for notifications
+    // Join user-specific rooms for notifications and live updates
     if (userId) {
       socket.join(`user-${userId}`);
+      socket.join(`customer-${userId}`);
+      socket.join(`appointments-${userId}`);
     }
 
     socket.emit("web-client-connected", {
@@ -175,40 +182,69 @@ io.on("connection", (socket) => {
     });
   });
 
+  // Handle mobile app connections (React Native / Expo)
+  socket.on("join-mobile-client", (data) => {
+    const { userId, role } = data || {};
+    socket.join("mobile-app");
+    socket.userId = userId;
+    socket.userType = role || "customer";
+    socket.clientType = "mobile-app";
+
+    console.log(`📱 Mobile App User ${userId} (${role || "customer"}) joined`);
+
+    if (userId) {
+      socket.join(`user-${userId}`);
+      socket.join(`customer-${userId}`);
+      socket.join(`appointments-${userId}`);
+    }
+
+    socket.emit("mobile-client-connected", {
+      message: "Connected to mobile real-time services",
+      socketId: socket.id,
+      clientType: "mobile-app",
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   // Handle staff attendance room (both clients)
   socket.on("join-attendance", (data) => {
     const { userId } = data || {};
     socket.join(`attendance-${userId}`);
     console.log(
-      `📍 User ${userId} joined attendance room (${socket.clientType})`,
+      `📍 User ${userId} joined attendance room (${socket.clientType})`
     );
   });
+
   // Handle customer booking notifications (both clients)
   socket.on("join-customer-notifications", (data) => {
     const { customerId } = data || {};
     socket.join(`customer-${customerId}`);
     console.log(
-      `🔔 Customer ${customerId} joined notifications (${socket.clientType})`,
+      `🔔 Customer ${customerId} joined notifications (${socket.clientType})`
     );
   });
-  // Handle appointment updates for web client
+
+  // Handle appointment updates
   socket.on("join-appointment-updates", (data) => {
     const { customerId } = data || {};
     socket.join(`appointments-${customerId}`);
     console.log(
-      `📅 Customer ${customerId} joined appointment updates (${socket.clientType})`,
+      `📅 Customer ${customerId} joined appointment updates (${socket.clientType})`
     );
   });
-  // Handle service updates for web client
+
+  // Handle service updates
   socket.on("join-service-updates", () => {
     socket.join("service-updates");
     console.log(`💇 Joined service updates (${socket.clientType})`);
   });
-  // Handle product updates for web client
+
+  // Handle product updates
   socket.on("join-product-updates", () => {
     socket.join("product-updates");
     console.log(`🛍️ Joined product updates (${socket.clientType})`);
   });
+
   // Handle disconnection
   socket.on("disconnect", (reason) => {
     console.log(`\n❌ Client disconnected: ${socket.id}`);
@@ -221,14 +257,14 @@ io.on("connection", (socket) => {
   socket.on("error", (error) => {
     console.error(
       `⚠️ Socket error for ${socket.id} (${socket.clientType}):`,
-      error,
+      error
     );
   });
 
   // Handle reconnection attempts
   socket.on("reconnect_attempt", () => {
     console.log(
-      `🔄 Client ${socket.id} (${socket.clientType}) attempting to reconnect`,
+      `🔄 Client ${socket.id} (${socket.clientType}) attempting to reconnect`
     );
   });
 });
@@ -251,6 +287,7 @@ app.use("/api/leaderboards", leaderboardsRoutes);
 app.use("/api/staff", staffRoutes);
 app.use("/api/stylists", stylistsRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/promos", promoRoutes);
 app.use("/uploads", express.static("uploads"));
 
 // ✅ ENHANCED HEALTH CHECK ENDPOINT
@@ -258,17 +295,17 @@ app.get("/api/health", (req, res) => {
   const clientStats = {
     "admin-dashboard": 0,
     "web-client": 0,
+    "mobile-app": 0,
     unknown: 0,
   };
 
-  // Count clients by type
   io.sockets.sockets.forEach((socket) => {
     clientStats[socket.clientType] = (clientStats[socket.clientType] || 0) + 1;
   });
 
   res.json({
     success: true,
-    message: "Backend server is running",
+    message: "Backend server is running with multi-platform support",
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV,
     clientUrls: {
@@ -291,6 +328,7 @@ app.get("/", (req, res) => {
   const clientStats = {
     "admin-dashboard": 0,
     "web-client": 0,
+    "mobile-app": 0,
     unknown: 0,
   };
 
@@ -299,8 +337,8 @@ app.get("/", (req, res) => {
   });
 
   res.json({
-    message: "Salon Services API with Multi-Client WebSocket Support",
-    version: "2.1.0",
+    message: "Salon Services API with Multi-Platform WebSocket & Promo Engine Support",
+    version: "2.5.0",
     status: "online",
     clientUrls: {
       admin: process.env.ADMIN_CLIENT_URL || "http://localhost:5173",
@@ -330,10 +368,11 @@ app.get("/", (req, res) => {
           "product-updates - Product catalog updates",
           "customer-{customerId} - Customer notifications",
         ],
+        mobile: [
+          "mobile-app - Mobile client connections",
+          "user-{userId} - Real-time mobile alerts",
+        ],
       },
-    },
-    endpoints: {
-      // ... (keep your existing endpoints documentation)
     },
   });
 });
@@ -345,30 +384,33 @@ app.get("/api/websocket/status", (req, res) => {
   const clientStats = {
     "admin-dashboard": 0,
     "web-client": 0,
+    "mobile-app": 0,
     unknown: 0,
   };
 
   const clientDetails = {
     "admin-dashboard": [],
     "web-client": [],
+    "mobile-app": [],
     unknown: [],
   };
 
-  // Count and list clients by type
   io.sockets.sockets.forEach((socket) => {
-    clientStats[socket.clientType] = (clientStats[socket.clientType] || 0) + 1;
-    clientDetails[socket.clientType].push({
-      id: socket.id,
-      userId: socket.userId || socket.adminId || "unknown",
-      rooms: Array.from(socket.rooms || []),
-    });
+    const cType = socket.clientType || "unknown";
+    clientStats[cType] = (clientStats[cType] || 0) + 1;
+    if (clientDetails[cType]) {
+      clientDetails[cType].push({
+        id: socket.id,
+        userId: socket.userId || socket.adminId || "unknown",
+        rooms: Array.from(socket.rooms || []),
+      });
+    }
   });
 
   const rooms = Array.from(io.sockets.adapter.rooms.keys()).filter(
-    (room) => !io.sockets.sockets.has(room),
+    (room) => !io.sockets.sockets.has(room)
   );
 
-  // Get detailed room info
   const roomDetails = {};
   rooms.forEach((room) => {
     const clients = io.sockets.adapter.rooms.get(room);
@@ -389,21 +431,14 @@ app.get("/api/websocket/status", (req, res) => {
   });
 });
 
-// ✅ ENHANCED TEST ENDPOINT - Specify target client type
+// Test emission endpoint
 app.post("/api/test/emit", (req, res) => {
   const {
     type = "test",
     message = "Test message",
     room = "admin-dashboard",
-    targetClientType = null, // 'admin-dashboard' or 'web-client'
+    targetClientType = null,
   } = req.body;
-
-  console.log(`\n🧪 Manual WebSocket Test from ${req.clientType}:`);
-  console.log(`   Type: ${type}`);
-  console.log(`   Message: ${message}`);
-  console.log(`   Room: ${room}`);
-  console.log(`   Target Client Type: ${targetClientType}`);
-  console.log(`   io exists: ${!!req.io}`);
 
   if (!req.io) {
     return res.status(500).json({
@@ -426,24 +461,16 @@ app.post("/api/test/emit", (req, res) => {
   let clientsNotified = 0;
 
   if (targetClientType) {
-    // Emit to specific client type
     io.sockets.sockets.forEach((socket) => {
       if (socket.clientType === targetClientType) {
         socket.emit("dashboard-update", payload);
         clientsNotified++;
       }
     });
-    console.log(
-      `   ✅ Emitted to ${clientsNotified} ${targetClientType} client(s)`,
-    );
   } else {
-    // Emit to room (original behavior)
     req.io.to(room).emit("dashboard-update", payload);
     const clientsInRoom = req.io.sockets.adapter.rooms.get(room);
     clientsNotified = clientsInRoom ? clientsInRoom.size : 0;
-    console.log(
-      `   ✅ Emitted to ${clientsNotified} client(s) in room "${room}"`,
-    );
   }
 
   res.json({
@@ -453,64 +480,6 @@ app.post("/api/test/emit", (req, res) => {
       : `Test event emitted to ${room} room`,
     clientsNotified,
     target: targetClientType || room,
-    payload,
-  });
-});
-
-// ✅ BROADCAST TO SPECIFIC CLIENT TYPE
-app.post("/api/test/broadcast-to-client-type", (req, res) => {
-  const {
-    message = "Broadcast test",
-    clientType, // 'admin-dashboard' or 'web-client'
-    eventType = "dashboard-update",
-  } = req.body;
-
-  if (!clientType) {
-    return res.status(400).json({
-      success: false,
-      message: "clientType is required (admin-dashboard or web-client)",
-    });
-  }
-
-  console.log(`\n📢 Broadcasting to ${clientType} clients...`);
-
-  if (!req.io) {
-    return res.status(500).json({
-      success: false,
-      message: "Socket.IO not available",
-    });
-  }
-
-  const payload = {
-    type: "broadcast-test",
-    action: "targeted-announcement",
-    data: {
-      message,
-      target: clientType,
-      source: "server",
-    },
-    timestamp: new Date().toISOString(),
-  };
-
-  let clientsNotified = 0;
-
-  // Broadcast to specific client type
-  io.sockets.sockets.forEach((socket) => {
-    if (socket.clientType === clientType) {
-      socket.emit(eventType, payload);
-      clientsNotified++;
-    }
-  });
-
-  console.log(
-    `   ✅ Broadcasted to ${clientsNotified} ${clientType} client(s)`,
-  );
-
-  res.json({
-    success: true,
-    message: `Broadcast sent to ${clientType} clients`,
-    clientsNotified,
-    clientType,
     payload,
   });
 });
@@ -553,7 +522,7 @@ connectDB()
 ║   📡 Server:     http://localhost:${PORT}             ║
 ║   📚 API Docs:   http://localhost:${PORT}/            ║
 ║   🔌 WebSocket:  ws://localhost:${PORT}               ║
-║   ⚡ Status:     MULTI-CLIENT READY                   ║
+║   ⚡ Status:     MULTI-PLATFORM READY (Web + Mobile)  ║
 ║                                                        ║
 ║   👨‍💼 Admin Dashboard: ${
         process.env.ADMIN_CLIENT_URL || "http://localhost:5173"
@@ -561,25 +530,10 @@ connectDB()
 ║   🌐 Web Client:      ${
         process.env.WEB_CLIENT_URL || "http://localhost:5174"
       } ║
+║   📱 Mobile Support:  Active (Expo / React Native)     ║
 ║                                                        ║
 ╚════════════════════════════════════════════════════════╝
       `);
-      console.log("🔍 WebSocket Debugging Tools:");
-      console.log(
-        "   📊 Status: GET  http://localhost:3000/api/websocket/status",
-      );
-      console.log("   🧪 Test:   POST http://localhost:3000/api/test/emit");
-      console.log(
-        "   🎯 Targeted Test: POST http://localhost:3000/api/test/broadcast-to-client-type",
-      );
-      console.log("\n   Example targeted test:");
-      console.log(
-        "   curl -X POST http://localhost:3000/api/test/broadcast-to-client-type \\",
-      );
-      console.log('     -H "Content-Type: application/json" \\');
-      console.log(
-        '     -d \'{"clientType":"web-client","message":"Hello Web Client!"}\'\n',
-      );
     });
   })
   .catch((err) => {
@@ -603,5 +557,5 @@ process.on("SIGINT", () => {
     process.exit(0);
   });
 });
-// Export io for use in other files if needed
+
 export { io };
